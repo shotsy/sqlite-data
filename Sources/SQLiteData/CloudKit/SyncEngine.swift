@@ -1488,22 +1488,36 @@
         if let table = tablesByName[recordType] {
           func open<T>(_: some SynchronizableTable<T>) async {
             await withErrorReporting(.sqliteDataCloudKitFailure) {
-              try await userDatabase.write { db in
-                try T
-                  .unscoped
-                  .where {
-                    #sql("\($0.primaryKey)").in(
-                      SyncMetadata.findAll(recordIDs)
-                        .select(\.recordPrimaryKey)
-                    )
-                  }
-                  .delete()
-                  .execute(db)
+              do {
+                try await userDatabase.write { db in
+                  try T
+                    .unscoped
+                    .where {
+                      #sql("\($0.primaryKey)").in(
+                        SyncMetadata.findAll(recordIDs)
+                          .select(\.recordPrimaryKey)
+                      )
+                    }
+                    .delete()
+                    .execute(db)
 
-                try UnsyncedRecordID
-                  .findAll(recordIDs)
-                  .delete()
-                  .execute(db)
+                  try UnsyncedRecordID
+                    .findAll(recordIDs)
+                    .delete()
+                    .execute(db)
+                }
+              } catch {
+                await delegate?.syncEngine(
+                  self,
+                  didReportError: error,
+                  context: SyncEngineErrorContext(
+                    operation: "handleFetchedRecordZoneChanges.deleteRecords",
+                    tableName: T.tableName,
+                    recordType: recordType,
+                    isRemoteDelete: true
+                  )
+                )
+                throw error
               }
             }
           }

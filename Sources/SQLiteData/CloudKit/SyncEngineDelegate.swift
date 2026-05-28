@@ -3,6 +3,28 @@
   import CustomDump
   import IssueReporting
 
+  /// Context describing an internal ``SyncEngine`` error that was caught and reported by
+  /// SQLiteData.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public struct SyncEngineErrorContext: Sendable {
+    public let operation: String
+    public let tableName: String?
+    public let recordType: String?
+    public let isRemoteDelete: Bool
+
+    public init(
+      operation: String,
+      tableName: String? = nil,
+      recordType: String? = nil,
+      isRemoteDelete: Bool = false
+    ) {
+      self.operation = operation
+      self.tableName = tableName
+      self.recordType = recordType
+      self.isRemoteDelete = isRemoteDelete
+    }
+  }
+
   /// An interface for observing ``SyncEngine`` events and customizing ``SyncEngine`` behavior.
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   public protocol SyncEngineDelegate: AnyObject, Sendable {
@@ -79,6 +101,17 @@
       _ syncEngine: SyncEngine,
       accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
     ) async
+
+    /// Called when SQLiteData catches and reports an internal CloudKit sync error.
+    ///
+    /// SQLiteData may recover from or swallow these errors after reporting them via
+    /// `withErrorReporting`. This hook lets applications mirror important failures into their own
+    /// telemetry pipelines without changing sync behavior.
+    func syncEngine(
+      _ syncEngine: SyncEngine,
+      didReportError error: any Error,
+      context: SyncEngineErrorContext
+    ) async
   }
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
@@ -98,5 +131,11 @@
         break
       }
     }
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine,
+      didReportError error: any Error,
+      context: SyncEngineErrorContext
+    ) async {}
   }
 #endif

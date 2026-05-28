@@ -175,6 +175,49 @@
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
       }
 
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func reportedError_RemoteDeleteForeignKeyFailure() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            Parent(id: 1)
+          }
+          try #sql(
+            """
+            CREATE TRIGGER prevent_parent_delete
+            BEFORE DELETE ON parents
+            BEGIN
+              SELECT RAISE(ABORT, 'blocked parent delete');
+            END
+            """
+          )
+          .execute(db)
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await withKnownIssue {
+          try await syncEngine.modifyRecords(
+            scope: .private,
+            deleting: [Parent.recordID(for: 1)]
+          )
+          .notify()
+        } matching: { issue in
+          issue.description.contains("blocked parent delete")
+        }
+
+        let reportedError = try #require(delegate.reportedErrors.withValue { $0.first })
+        #expect(reportedError.context.operation == "handleFetchedRecordZoneChanges.deleteRecords")
+        #expect(reportedError.context.tableName == Parent.tableName)
+        #expect(reportedError.context.recordType == Parent.tableName)
+        #expect(reportedError.context.isRemoteDelete)
+        #expect(String(describing: reportedError.error).contains("blocked parent delete"))
+
+        try await userDatabase.read { db in
+          try #expect(Parent.find(1).fetchOne(db) != nil)
+        }
+      }
+
       @Test($syncEngineDelegate.set(DefaultImplementationDelegate()))
       func accountChanged_DefaultImplementation() async throws {
         try await userDatabase.userWrite { db in
@@ -237,6 +280,28 @@
         Issue.record("Delegate method 'syncEngine(_:accountChanged:)' was not called.")
         return
       }
+    }
+  }
+
+  final class ErrorReportingDelegate: SyncEngineDelegate {
+    struct ReportedError: Sendable {
+      let error: any Error
+      let context: SyncEngineErrorContext
+    }
+
+    let reportedErrors = LockIsolated<[ReportedError]>([])
+
+    func syncEngine(
+      _ syncEngine: SQLiteData.SyncEngine,
+      accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
+    ) async {}
+
+    func syncEngine(
+      _ syncEngine: SQLiteData.SyncEngine,
+      didReportError error: any Error,
+      context: SyncEngineErrorContext
+    ) async {
+      reportedErrors.withValue { $0.append(ReportedError(error: error, context: context)) }
     }
   }
 
