@@ -543,6 +543,7 @@
             currentRecordTypeByTableName: currentRecordTypeByTableName
           )
           try await cacheUserTables(recordTypes: currentRecordTypes)
+          await scheduleDurableRecordZoneFailureRetries()
         }
       }
       self.startTask.withValue {
@@ -1392,10 +1393,40 @@
       deletions: [(zoneID: CKRecordZone.ID, reason: CKDatabase.DatabaseChange.Deletion.Reason)],
       syncEngine: any SyncEngineProtocol
     ) async {
-      let defaultZoneDeleted =
+      for (zoneID, reason) in deletions {
+        guard reason == .deleted || reason == .purged else { continue }
+        let recordCountsByType =
+          await withErrorReporting(.sqliteDataCloudKitFailure) {
+            try await metadatabase.read { db in
+              Dictionary(
+                grouping:
+                  try SyncMetadata
+                  .where { $0.zoneName.eq(zoneID.zoneName) && $0.ownerName.eq(zoneID.ownerName) }
+                  .select(\.recordType)
+                  .fetchAll(db),
+                by: { $0 }
+              )
+              .mapValues(\.count)
+            }
+          }
+          ?? [:]
+        await delegate?.syncEngine(
+          self,
+          willDeleteLocalRecords: SyncEngineZoneDeletionContext(
+            zoneID: zoneID,
+            reason: reason,
+            recordCountsByType: recordCountsByType
+          )
+        )
+      }
+
+      // NB: 'syncEngine.state' must not be mutated inside this transaction: if a later statement
+      //     throws, the database rolls back but the sync engine state would not.
+      let deletionResults =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await userDatabase.write { db in
             var defaultZoneDeleted = false
+            var pendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
             for (zoneID, reason) in deletions {
               switch reason {
               case .deleted, .purged:
@@ -1404,17 +1435,19 @@
                   defaultZoneDeleted = true
                 }
               case .encryptedDataReset:
-                try uploadRecords(in: zoneID, db: db)
+                pendingRecordZoneChanges += try uploadRecords(in: zoneID, db: db)
               @unknown default:
                 reportIssue("Unknown deletion reason: \(reason)")
               }
             }
-            return defaultZoneDeleted
+            return (defaultZoneDeleted, pendingRecordZoneChanges)
           }
         }
-        ?? false
-      if defaultZoneDeleted {
-        syncEngine.state.add(pendingDatabaseChanges: [.saveZone(self.defaultZone)])
+      if let deletionResults {
+        syncEngine.state.add(pendingRecordZoneChanges: deletionResults.1)
+        if deletionResults.0 {
+          syncEngine.state.add(pendingDatabaseChanges: [.saveZone(self.defaultZone)])
+        }
       }
       @Sendable
       func deleteRecords(in zoneID: CKRecordZone.ID, db: Database) throws {
@@ -1441,7 +1474,10 @@
         }
       }
       @Sendable
-      func uploadRecords(in zoneID: CKRecordZone.ID, db: Database) throws {
+      func uploadRecords(
+        in zoneID: CKRecordZone.ID,
+        db: Database
+      ) throws -> [CKSyncEngine.PendingRecordZoneChange] {
         let recordTypes = Set(
           try SyncMetadata
             .where(\.hasLastKnownServerRecord)
@@ -1464,7 +1500,7 @@
           }
           open(table)
         }
-        syncEngine.state.add(pendingRecordZoneChanges: pendingRecordZoneChanges)
+        return pendingRecordZoneChanges
       }
     }
 
@@ -1473,6 +1509,28 @@
       deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)] = [],
       syncEngine: any SyncEngineProtocol
     ) async {
+      let protectedRecordIDs: (Set<CKRecord.ID>, Set<CKRecord.ID>) =
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await metadatabase.read { db in
+            let terminalDeleteIDs = try DurableRecordZoneFailure
+              .findAll(modifications.map(\.recordID), action: DurableRecordZoneFailure.deleteAction)
+              .where(\.isTerminal)
+              .fetchAll(db)
+              .map(\.recordID)
+            let terminalSaveIDs = try DurableRecordZoneFailure
+              .findAll(deletions.map(\.recordID), action: DurableRecordZoneFailure.saveAction)
+              .where(\.isTerminal)
+              .fetchAll(db)
+              .map(\.recordID)
+            return (Set(terminalDeleteIDs), Set(terminalSaveIDs))
+          }
+        }
+        ?? (Set(), Set())
+      let applicableModifications = modifications.filter {
+        !protectedRecordIDs.0.contains($0.recordID)
+      }
+      let deletions = deletions.filter { !protectedRecordIDs.1.contains($0.recordID) }
+
       let deletedRecordIDsByRecordType = OrderedDictionary(
         grouping: deletions.sorted { lhs, rhs in
           topologicallyAscending(
@@ -1511,7 +1569,8 @@
                   self,
                   didReportError: error,
                   context: SyncEngineErrorContext(
-                    operation: "handleFetchedRecordZoneChanges.deleteRecords",
+                    operation: .fetchedRecordDeletion,
+                    disposition: .terminalDroppedOrReconciled,
                     tableName: T.tableName,
                     recordType: recordType,
                     isRemoteDelete: true
@@ -1550,7 +1609,7 @@
                 .map(CKRecord.ID.init(unsyncedRecordID:))
             )
           }
-          let modificationRecordIDs = Set(modifications.map(\.recordID))
+          let modificationRecordIDs = Set(applicableModifications.map(\.recordID))
           let unsyncedRecordIDsToDelete = modificationRecordIDs.intersection(unsyncedRecordIDs)
           unsyncedRecordIDs.subtract(modificationRecordIDs)
           if !unsyncedRecordIDsToDelete.isEmpty {
@@ -1593,7 +1652,7 @@
         }
         ?? [CKRecord]()
 
-      let modifications = (modifications + unsyncedRecords).sorted { lhs, rhs in
+      let modifications = (applicableModifications + unsyncedRecords).sorted { lhs, rhs in
         topologicallyAscending(
           lhsTableName: lhs.recordType,
           rhsTableName: rhs.recordType,
@@ -1605,24 +1664,33 @@
         case share(CKShare)
         case reference(CKShare.Reference)
       }
-      let shares: [ShareOrReference] =
-        await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await userDatabase.write { db in
-            var shares: [ShareOrReference] = []
-            for record in modifications {
-              if let share = record as? CKShare {
-                shares.append(.share(share))
-              } else {
-                upsertFromServerRecord(record, db: db)
-                if let shareReference = record.share {
-                  shares.append(.reference(shareReference))
-                }
-              }
+      var shares: [ShareOrReference] = []
+      for record in modifications {
+        if let share = record as? CKShare {
+          shares.append(.share(share))
+        } else {
+          do {
+            try await userDatabase.write { db in
+              try upsertFromServerRecord(record, db: db)
             }
-            return shares
+          } catch {
+            await delegate?.syncEngine(
+              self,
+              didReportError: error,
+              context: SyncEngineErrorContext(
+                operation: .fetchedRecordApplication,
+                disposition: .terminalDroppedOrReconciled,
+                tableName: tablesByName[record.recordType]?.base.tableName,
+                recordType: record.recordType
+              )
+            )
+            continue
+          }
+          if let shareReference = record.share {
+            shares.append(.reference(shareReference))
           }
         }
-        ?? []
+      }
 
       await withTaskGroup(of: Void.self) { group in
         for share in shares {
@@ -1667,6 +1735,111 @@
       }
     }
 
+    private func durableRecordZoneFailure(
+      recordID: CKRecord.ID,
+      action: String
+    ) async -> DurableRecordZoneFailure? {
+      await withErrorReporting(.sqliteDataCloudKitFailure) {
+        try await metadatabase.read { db in
+          try DurableRecordZoneFailure.find(recordID, action: action).fetchOne(db)
+        }
+      } ?? nil
+    }
+
+    @discardableResult
+    private func persistDurableRecordZoneFailure(
+      recordID: CKRecord.ID,
+      action: String,
+      recordType: String?,
+      error: CKError,
+      isTerminal: Bool
+    ) async -> DurableRecordZoneFailure? {
+      let attemptCount =
+        (await durableRecordZoneFailure(recordID: recordID, action: action)?.attemptCount ?? 0) + 1
+      let failure = DurableRecordZoneFailure(
+        recordID: recordID,
+        action: action,
+        recordType: recordType,
+        errorCode: error.code,
+        attemptCount: attemptCount,
+        isTerminal: isTerminal
+      )
+      return await withErrorReporting(.sqliteDataCloudKitFailure) {
+        try await userDatabase.write { db in
+          try DurableRecordZoneFailure.insert { failure } onConflictDoUpdate: {
+            $0.recordType = failure.recordType
+            $0.errorCode = failure.errorCode
+            $0.attemptCount = failure.attemptCount
+            $0.isTerminal = failure.isTerminal
+          }
+          .execute(db)
+        }
+        return failure
+      }
+    }
+
+    private func clearDurableRecordZoneFailures(recordIDs: [CKRecord.ID]) async {
+      guard !recordIDs.isEmpty else { return }
+      await withErrorReporting(.sqliteDataCloudKitFailure) {
+        try await userDatabase.write { db in
+          try DurableRecordZoneFailure
+            .where {
+              let condition: QueryFragment = recordIDs.map {
+                "(\(bind: $0.recordName), \(bind: $0.zoneID.zoneName), \(bind: $0.zoneID.ownerName))"
+              }
+              .joined(separator: ", ")
+              #sql("(\($0.recordName), \($0.zoneName), \($0.ownerName)) IN (\(condition))")
+            }
+            .delete()
+            .execute(db)
+        }
+      }
+    }
+
+    private func scheduleDurableRecordZoneFailureRetry(_ failure: DurableRecordZoneFailure) {
+      guard !failure.isTerminal else { return }
+      let exponent = min(max(failure.attemptCount - 1, 0), 5)
+      let delay = min(30 * pow(2, Double(exponent)), 900)
+      Task { [weak self] in
+        @Dependency(\.continuousClock) var clock
+        do {
+          try await clock.sleep(for: .seconds(delay))
+        } catch {
+          return
+        }
+        guard
+          let self,
+          let currentFailure = await self.durableRecordZoneFailure(
+            recordID: failure.recordID,
+            action: failure.action
+          ),
+          !currentFailure.isTerminal
+        else { return }
+        let change: CKSyncEngine.PendingRecordZoneChange =
+          currentFailure.action == DurableRecordZoneFailure.deleteAction
+          ? .deleteRecord(currentFailure.recordID)
+          : .saveRecord(currentFailure.recordID)
+        self.syncEngines.withValue {
+          let engine =
+            currentFailure.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
+          engine?.state.add(pendingRecordZoneChanges: [change])
+        }
+      }
+    }
+
+    private func scheduleDurableRecordZoneFailureRetries() async {
+      let failures =
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await metadatabase.read { db in
+            try DurableRecordZoneFailure.where { !$0.isTerminal }.fetchAll(db)
+          }
+        }
+        ?? []
+      for failure in failures {
+        scheduleDurableRecordZoneFailureRetry(failure)
+      }
+    }
+
     package func handleSentRecordZoneChanges(
       savedRecords: [CKRecord] = [],
       failedRecordSaves: [(record: CKRecord, error: CKError)] = [],
@@ -1677,6 +1850,9 @@
       for savedRecord in savedRecords {
         await refreshLastKnownServerRecord(savedRecord)
       }
+      await clearDurableRecordZoneFailures(
+        recordIDs: savedRecords.map(\.recordID) + deletedRecordIDs
+      )
 
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
       var newPendingDatabaseChanges: [CKSyncEngine.PendingDatabaseChange] = []
@@ -1685,16 +1861,31 @@
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
       for (failedRecord, error) in failedRecordSaves {
-        func reportLocalSaveFailure() async {
+        func reportLocalSaveFailure(
+          _ reportedError: any Error = error,
+          disposition: SyncEngineErrorDisposition
+        ) async {
           await delegate?.syncEngine(
             self,
-            didReportError: error,
+            didReportError: reportedError,
             context: SyncEngineErrorContext(
-              operation: "handleSentRecordZoneChanges.saveRecords",
+              operation: .sentRecordSave,
+              disposition: disposition,
               tableName: tablesByName[failedRecord.recordType]?.base.tableName,
               recordType: failedRecord.recordType,
               isLocalSaveFailure: true
             )
+          )
+        }
+
+        @discardableResult
+        func persistLocalSaveFailure(isTerminal: Bool) async -> DurableRecordZoneFailure? {
+          await persistDurableRecordZoneFailure(
+            recordID: failedRecord.recordID,
+            action: DurableRecordZoneFailure.saveAction,
+            recordType: failedRecord.recordType,
+            error: error,
+            isTerminal: isTerminal
           )
         }
 
@@ -1710,13 +1901,38 @@
         }
 
         switch error.code {
-        case .serverRecordChanged, .serverRejectedRequest:
-          if error.code == .serverRejectedRequest {
-            await reportLocalSaveFailure()
+        case .serverRecordChanged:
+          guard let serverRecord = error.serverRecord
+          else { continue }
+          do {
+            try await upsertFromServerRecord(serverRecord)
+            newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+            await reportLocalSaveFailure(disposition: .recoveredAndRetried)
+          } catch {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(error, disposition: .terminalDroppedOrReconciled)
           }
-          guard let serverRecord = error.serverRecord else { continue }
-          await upsertFromServerRecord(serverRecord)
-          newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+
+        case .serverRejectedRequest:
+          let previousFailure = await durableRecordZoneFailure(
+            recordID: failedRecord.recordID,
+            action: DurableRecordZoneFailure.saveAction
+          )
+          guard previousFailure?.attemptCount ?? 0 < 1, let serverRecord = error.serverRecord
+          else {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
+            continue
+          }
+          await persistLocalSaveFailure(isTerminal: false)
+          do {
+            try await upsertFromServerRecord(serverRecord)
+            newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+            await reportLocalSaveFailure(disposition: .recoveredAndRetried)
+          } catch {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(error, disposition: .terminalDroppedOrReconciled)
+          }
 
         case .zoneNotFound:
           let zone = CKRecordZone(zoneID: failedRecord.recordID.zoneID)
@@ -1735,6 +1951,8 @@
             foreignKeysByTableName[table.base.tableName]?.count == 1,
             let foreignKey = foreignKeysByTableName[table.base.tableName]?.first
           else {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
             continue
           }
           func open<T>(_: some SynchronizableTable<T>) async throws {
@@ -1785,21 +2003,32 @@
               }
             }
           }
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
+          do {
             try await open(table)
+            await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
+          } catch {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(
+              error,
+              disposition: .terminalDroppedOrReconciled
+            )
           }
 
         case .permissionFailure:
           guard
             let recordPrimaryKey = failedRecord.recordID.recordPrimaryKey,
             let table = tablesByName[failedRecord.recordType]
-          else { continue }
+          else {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
+            continue
+          }
           func open<T>(_: some SynchronizableTable<T>) async throws {
             do {
               let serverRecord = try await container.sharedCloudDatabase.record(
                 for: failedRecord.recordID
               )
-              await upsertFromServerRecord(serverRecord, force: true)
+              try await upsertFromServerRecord(serverRecord, force: true)
             } catch let error as CKError where error.code == .unknownItem {
               try await userDatabase.write { db in
                 try T
@@ -1810,34 +2039,52 @@
               }
             }
           }
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
+          do {
             try await open(table)
+            await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
+          } catch {
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(
+              error,
+              disposition: .terminalDroppedOrReconciled
+            )
           }
 
         case .batchRequestFailed:
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
-          break
+          await reportLocalSaveFailure(disposition: .transientPendingRetry)
 
         case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
           .notAuthenticated, .operationCancelled, .internalError, .partialFailure,
           .requestRateLimited, .resultsTruncated, .changeTokenExpired, .serverResponseLost,
           .assetNotAvailable, .accountTemporarilyUnavailable:
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+          await reportLocalSaveFailure(disposition: .transientPendingRetry)
 
         case .userDeletedZone:
-          await reportLocalSaveFailure()
+          await persistLocalSaveFailure(isTerminal: true)
+          await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
+
+        case .quotaExceeded, .limitExceeded:
+          if let failure = await persistLocalSaveFailure(isTerminal: false) {
+            scheduleDurableRecordZoneFailureRetry(failure)
+          }
+          await reportLocalSaveFailure(disposition: .transientPendingRetry)
 
         case .badContainer, .missingEntitlement, .invalidArguments, .assetFileNotFound,
           .assetFileModified, .incompatibleVersion, .constraintViolation, .badDatabase,
-          .quotaExceeded, .limitExceeded, .tooManyParticipants, .alreadyShared,
-          .managedAccountRestricted, .participantMayNeedVerification:
-          await reportLocalSaveFailure()
+          .tooManyParticipants, .alreadyShared, .managedAccountRestricted,
+          .participantMayNeedVerification:
+          await persistLocalSaveFailure(isTerminal: true)
+          await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
         #if canImport(FoundationModels)
           case .participantAlreadyInvited:
-            await reportLocalSaveFailure()
+            await persistLocalSaveFailure(isTerminal: true)
+            await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
         #endif
         @unknown default:
-          await reportLocalSaveFailure()
+          await persistLocalSaveFailure(isTerminal: true)
+          await reportLocalSaveFailure(disposition: .terminalDroppedOrReconciled)
         }
       }
 
@@ -1845,7 +2092,40 @@
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await userDatabase.write { db in
             var enqueuedUnsyncedRecordID = false
-            var terminalFailures: [(recordID: CKRecord.ID, error: CKError)] = []
+            var reportedFailures: [(
+              recordID: CKRecord.ID, error: CKError, disposition: SyncEngineErrorDisposition
+            )] = []
+            var durableRetries: [DurableRecordZoneFailure] = []
+            // NB: 'syncEngine.state' must not be mutated inside this transaction: if a later
+            //     statement throws, the database rolls back but the sync engine state would not.
+            var pendingChangesToAdd: [CKSyncEngine.PendingRecordZoneChange] = []
+            var pendingChangesToRemove: [CKSyncEngine.PendingRecordZoneChange] = []
+            func persistFailure(
+              recordID: CKRecord.ID,
+              error: CKError,
+              isTerminal: Bool
+            ) throws -> DurableRecordZoneFailure {
+              let attemptCount =
+                (try DurableRecordZoneFailure
+                  .find(recordID, action: DurableRecordZoneFailure.deleteAction)
+                  .fetchOne(db)?.attemptCount ?? 0) + 1
+              let failure = DurableRecordZoneFailure(
+                recordID: recordID,
+                action: DurableRecordZoneFailure.deleteAction,
+                recordType: recordID.tableName,
+                errorCode: error.code,
+                attemptCount: attemptCount,
+                isTerminal: isTerminal
+              )
+              try DurableRecordZoneFailure.insert { failure } onConflictDoUpdate: {
+                $0.recordType = failure.recordType
+                $0.errorCode = failure.errorCode
+                $0.attemptCount = failure.attemptCount
+                $0.isTerminal = failure.isTerminal
+              }
+              .execute(db)
+              return failure
+            }
             for (failedRecordID, error) in failedRecordDeletes {
               switch error.code {
               case .referenceViolation:
@@ -1855,47 +2135,75 @@
                 } onConflictDoUpdate: { _ in
                 }
                 .execute(db)
-                syncEngine.state.remove(pendingRecordZoneChanges: [.deleteRecord(failedRecordID)])
-                break
+                pendingChangesToRemove.append(.deleteRecord(failedRecordID))
+                reportedFailures.append(
+                  (failedRecordID, error, .terminalDroppedOrReconciled)
+                )
               case .batchRequestFailed:
-                syncEngine.state.add(pendingRecordZoneChanges: [.deleteRecord(failedRecordID)])
-                break
+                pendingChangesToAdd.append(.deleteRecord(failedRecordID))
+                reportedFailures.append((failedRecordID, error, .transientPendingRetry))
               case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
                 .notAuthenticated, .operationCancelled, .internalError, .partialFailure,
                 .requestRateLimited, .resultsTruncated, .changeTokenExpired,
                 .serverResponseLost, .assetNotAvailable, .accountTemporarilyUnavailable,
                 .serverRecordChanged:
-                syncEngine.state.add(pendingRecordZoneChanges: [.deleteRecord(failedRecordID)])
-                break
+                pendingChangesToAdd.append(.deleteRecord(failedRecordID))
+                reportedFailures.append((failedRecordID, error, .transientPendingRetry))
+              case .quotaExceeded, .limitExceeded:
+                let failure = try persistFailure(
+                  recordID: failedRecordID,
+                  error: error,
+                  isTerminal: false
+                )
+                durableRetries.append(failure)
+                reportedFailures.append((failedRecordID, error, .transientPendingRetry))
               case .badContainer, .missingEntitlement, .invalidArguments, .assetFileNotFound,
                 .assetFileModified, .incompatibleVersion, .constraintViolation, .badDatabase,
-                .quotaExceeded, .limitExceeded, .tooManyParticipants, .alreadyShared,
-                .managedAccountRestricted, .participantMayNeedVerification, .permissionFailure,
-                .serverRejectedRequest:
-                terminalFailures.append((failedRecordID, error))
-                break
+                .tooManyParticipants, .alreadyShared, .managedAccountRestricted,
+                .participantMayNeedVerification, .permissionFailure, .serverRejectedRequest:
+                _ = try persistFailure(recordID: failedRecordID, error: error, isTerminal: true)
+                reportedFailures.append(
+                  (failedRecordID, error, .terminalDroppedOrReconciled)
+                )
               case .userDeletedZone, .unknownItem, .zoneNotFound:
-                break
+                reportedFailures.append(
+                  (failedRecordID, error, .terminalDroppedOrReconciled)
+                )
               #if canImport(FoundationModels)
                 case .participantAlreadyInvited:
-                  terminalFailures.append((failedRecordID, error))
-                  break
+                  _ = try persistFailure(recordID: failedRecordID, error: error, isTerminal: true)
+                  reportedFailures.append(
+                    (failedRecordID, error, .terminalDroppedOrReconciled)
+                  )
               #endif
               @unknown default:
-                terminalFailures.append((failedRecordID, error))
-                break
+                _ = try persistFailure(recordID: failedRecordID, error: error, isTerminal: true)
+                reportedFailures.append(
+                  (failedRecordID, error, .terminalDroppedOrReconciled)
+                )
               }
             }
-            return (enqueuedUnsyncedRecordID, terminalFailures)
+            return (
+              enqueuedUnsyncedRecordID, reportedFailures, pendingChangesToAdd,
+              pendingChangesToRemove, durableRetries
+            )
           }
         }
-      for (recordID, error) in failedDeleteHandling?.1 ?? [] {
+      if let failedDeleteHandling {
+        syncEngine.state.remove(pendingRecordZoneChanges: failedDeleteHandling.3)
+        syncEngine.state.add(pendingRecordZoneChanges: failedDeleteHandling.2)
+        for failure in failedDeleteHandling.4 {
+          scheduleDurableRecordZoneFailureRetry(failure)
+        }
+      }
+      for (recordID, error, disposition) in failedDeleteHandling?.1 ?? [] {
         let recordType = recordID.tableName
         await delegate?.syncEngine(
           self,
           didReportError: error,
           context: SyncEngineErrorContext(
-            operation: "handleSentRecordZoneChanges.deleteRecords",
+            operation: .sentRecordDelete,
+            disposition: disposition,
             tableName: recordType.flatMap { tablesByName[$0]?.base.tableName },
             recordType: recordType,
             isLocalDeleteFailure: true
@@ -1953,11 +2261,9 @@
     private func upsertFromServerRecord(
       _ serverRecord: CKRecord,
       force: Bool = false
-    ) async {
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          upsertFromServerRecord(serverRecord, force: force, db: db)
-        }
+    ) async throws {
+      try await userDatabase.write { db in
+        try upsertFromServerRecord(serverRecord, force: force, db: db)
       }
     }
 
@@ -1965,91 +2271,89 @@
       _ serverRecord: CKRecord,
       force: Bool = false,
       db: Database
-    ) {
-      withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard
-          let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey,
-          serverRecord.encryptedValues[CKRecord.userModificationTimeKey] != nil
-        else {
-          return
-        }
-
-        try SyncMetadata.insert {
-          SyncMetadata(
-            recordPrimaryKey: recordPrimaryKey,
-            recordType: serverRecord.recordType,
-            zoneName: serverRecord.recordID.zoneID.zoneName,
-            ownerName: serverRecord.recordID.zoneID.ownerName,
-            parentRecordPrimaryKey: serverRecord.parent?.recordID.recordPrimaryKey,
-            parentRecordType: serverRecord.parent?.recordID.tableName,
-            lastKnownServerRecord: serverRecord,
-            _lastKnownServerRecordAllFields: serverRecord,
-            share: nil,
-            userModificationTime: serverRecord.userModificationTime
-          )
-        } onConflict: {
-          ($0.recordPrimaryKey, $0.recordType)
-        } doUpdate: {
-          if tablesByName[serverRecord.recordType] == nil {
-            $0.setLastKnownServerRecord(serverRecord)
-          } else {
-            $0.zoneName = serverRecord.recordID.zoneID.zoneName
-            $0.ownerName = serverRecord.recordID.zoneID.ownerName
-          }
-        }
-        .execute(db)
-
-        guard
-          let metadata = try SyncMetadata.find(serverRecord.recordID).fetchOne(db),
-          let table = tablesByName[serverRecord.recordType]
-        else {
-          return
-        }
-
-        serverRecord.userModificationTime = metadata.userModificationTime
-
-        func open<T>(_ table: some SynchronizableTable<T>) throws {
-          var columnNames: [String] = T.TableColumns.writableColumns.map(\.name)
-          if !force,
-            let allFields = metadata._lastKnownServerRecordAllFields,
-            let row = try T.unscoped.find(#sql("\(bind: metadata.recordPrimaryKey)")).fetchOne(db)
-          {
-            serverRecord.update(
-              with: allFields,
-              row: T(queryOutput: row),
-              columnNames: &columnNames,
-              parentForeignKey: foreignKeysByTableName[T.tableName]?.count == 1
-                ? foreignKeysByTableName[T.tableName]?.first
-                : nil
-            )
-          }
-
-          do {
-            try $_currentZoneID.withValue(serverRecord.recordID.zoneID) {
-              try #sql(upsert(table, record: serverRecord, columnNames: columnNames)).execute(db)
-            }
-            try UnsyncedRecordID.find(serverRecord.recordID).delete().execute(db)
-            try SyncMetadata
-              .find(serverRecord.recordID)
-              .update { $0.setLastKnownServerRecord(serverRecord) }
-              .execute(db)
-          } catch {
-            guard
-              let error = error as? DatabaseError,
-              error.resultCode == .SQLITE_CONSTRAINT,
-              error.extendedResultCode == .SQLITE_CONSTRAINT_FOREIGNKEY
-            else {
-              throw error
-            }
-            try UnsyncedRecordID.insert {
-              UnsyncedRecordID(recordID: serverRecord.recordID)
-            } onConflictDoUpdate: { _ in
-            }
-            .execute(db)
-          }
-        }
-        try open(table)
+    ) throws {
+      guard
+        let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey,
+        serverRecord.encryptedValues[CKRecord.userModificationTimeKey] != nil
+      else {
+        return
       }
+
+      try SyncMetadata.insert {
+        SyncMetadata(
+          recordPrimaryKey: recordPrimaryKey,
+          recordType: serverRecord.recordType,
+          zoneName: serverRecord.recordID.zoneID.zoneName,
+          ownerName: serverRecord.recordID.zoneID.ownerName,
+          parentRecordPrimaryKey: serverRecord.parent?.recordID.recordPrimaryKey,
+          parentRecordType: serverRecord.parent?.recordID.tableName,
+          lastKnownServerRecord: serverRecord,
+          _lastKnownServerRecordAllFields: serverRecord,
+          share: nil,
+          userModificationTime: serverRecord.userModificationTime
+        )
+      } onConflict: {
+        ($0.recordPrimaryKey, $0.recordType)
+      } doUpdate: {
+        if tablesByName[serverRecord.recordType] == nil {
+          $0.setLastKnownServerRecord(serverRecord)
+        } else {
+          $0.zoneName = serverRecord.recordID.zoneID.zoneName
+          $0.ownerName = serverRecord.recordID.zoneID.ownerName
+        }
+      }
+      .execute(db)
+
+      guard
+        let metadata = try SyncMetadata.find(serverRecord.recordID).fetchOne(db),
+        let table = tablesByName[serverRecord.recordType]
+      else {
+        return
+      }
+
+      serverRecord.userModificationTime = metadata.userModificationTime
+
+      func open<T>(_ table: some SynchronizableTable<T>) throws {
+        var columnNames: [String] = T.TableColumns.writableColumns.map(\.name)
+        if !force,
+          let allFields = metadata._lastKnownServerRecordAllFields,
+          let row = try T.unscoped.find(#sql("\(bind: metadata.recordPrimaryKey)")).fetchOne(db)
+        {
+          serverRecord.update(
+            with: allFields,
+            row: T(queryOutput: row),
+            columnNames: &columnNames,
+            parentForeignKey: foreignKeysByTableName[T.tableName]?.count == 1
+              ? foreignKeysByTableName[T.tableName]?.first
+              : nil
+          )
+        }
+
+        do {
+          try $_currentZoneID.withValue(serverRecord.recordID.zoneID) {
+            try #sql(upsert(table, record: serverRecord, columnNames: columnNames)).execute(db)
+          }
+          try UnsyncedRecordID.find(serverRecord.recordID).delete().execute(db)
+          try SyncMetadata
+            .find(serverRecord.recordID)
+            .update { $0.setLastKnownServerRecord(serverRecord) }
+            .execute(db)
+        } catch {
+          guard
+            let error = error as? DatabaseError,
+            error.resultCode == .SQLITE_CONSTRAINT,
+            error.extendedResultCode == .SQLITE_CONSTRAINT_FOREIGNKEY
+          else {
+            throw error
+          }
+          try UnsyncedRecordID.insert {
+            UnsyncedRecordID(recordID: serverRecord.recordID)
+          } onConflictDoUpdate: { _ in
+          }
+          .execute(db)
+        }
+      }
+      try open(table)
     }
 
     private func refreshLastKnownServerRecord(_ record: CKRecord) async {

@@ -124,6 +124,24 @@
       )
       .execute(db)
     }
+    migrator.registerMigration("Create Durable Record Zone Failures") { db in
+      try #sql(
+        """
+        CREATE TABLE "\(raw: .sqliteDataCloudKitSchemaName)_durableRecordZoneFailures" (
+          "recordName" TEXT NOT NULL,
+          "zoneName" TEXT NOT NULL,
+          "ownerName" TEXT NOT NULL,
+          "action" TEXT NOT NULL,
+          "recordType" TEXT,
+          "errorCode" INTEGER NOT NULL,
+          "attemptCount" INTEGER NOT NULL,
+          "isTerminal" INTEGER NOT NULL,
+          PRIMARY KEY ("recordName", "zoneName", "ownerName", "action")
+        ) STRICT
+        """
+      )
+      .execute(db)
+    }
     #if DEBUG
       try metadatabase.read { db in
         let hasSchemaChanges = try migrator.hasSchemaChanges(db)

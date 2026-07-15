@@ -585,19 +585,21 @@
           expectNoDifference(recordTypesAfterMigration, recordTypes)
           relaunchedSyncEngine.stop()
           try relaunchedSyncEngine.tearDownSyncEngine()
-          assertInlineSnapshot(of: container, as: .customDump) {
-            """
-            MockCloudContainer(
-              privateCloudDatabase: MockCloudDatabase(
-                databaseScope: .private,
-                storage: []
-              ),
-              sharedCloudDatabase: MockCloudDatabase(
-                databaseScope: .shared,
-                storage: []
+          await MainActor.run {
+            assertInlineSnapshot(of: container, as: .customDump) {
+              """
+              MockCloudContainer(
+                privateCloudDatabase: MockCloudDatabase(
+                  databaseScope: .private,
+                  storage: []
+                ),
+                sharedCloudDatabase: MockCloudDatabase(
+                  databaseScope: .shared,
+                  storage: []
+                )
               )
-            )
-            """
+              """
+            }
           }
         }
 
@@ -610,27 +612,29 @@
             privateTables: syncEngine.privateTables
           )
           try await relaunchedSyncEngine.processPendingRecordZoneChanges(scope: .private)
-          assertInlineSnapshot(of: container, as: .customDump) {
-            """
-            MockCloudContainer(
-              privateCloudDatabase: MockCloudDatabase(
-                databaseScope: .private,
-                storage: [
-                  [0]: CKRecord(
-                    recordID: CKRecord.ID(1:foos/zone/__defaultOwner__),
-                    recordType: "foos",
-                    parent: nil,
-                    share: nil,
-                    id: 1
-                  )
-                ]
-              ),
-              sharedCloudDatabase: MockCloudDatabase(
-                databaseScope: .shared,
-                storage: []
+          await MainActor.run {
+            assertInlineSnapshot(of: container, as: .customDump) {
+              """
+              MockCloudContainer(
+                privateCloudDatabase: MockCloudDatabase(
+                  databaseScope: .private,
+                  storage: [
+                    [0]: CKRecord(
+                      recordID: CKRecord.ID(1:foos/zone/__defaultOwner__),
+                      recordType: "foos",
+                      parent: nil,
+                      share: nil,
+                      id: 1
+                    )
+                  ]
+                ),
+                sharedCloudDatabase: MockCloudDatabase(
+                  databaseScope: .shared,
+                  storage: []
+                )
               )
-            )
-            """
+              """
+            }
           }
         }
       }

@@ -3,16 +3,66 @@
   import CustomDump
   import IssueReporting
 
+  /// The sync operation during which a reported ``SyncEngine`` error occurred.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public enum SyncEngineOperation: String, Sendable, Equatable {
+    /// A locally-changed record failed to save to CloudKit.
+    case sentRecordSave = "handleSentRecordZoneChanges.saveRecords"
+    /// A locally-deleted record failed to delete from CloudKit.
+    case sentRecordDelete = "handleSentRecordZoneChanges.deleteRecords"
+    /// A record fetched from CloudKit failed to apply to the local database.
+    case fetchedRecordApplication = "handleFetchedRecordZoneChanges.saveRecords"
+    /// A deletion fetched from CloudKit failed to apply to the local database.
+    case fetchedRecordDeletion = "handleFetchedRecordZoneChanges.deleteRecords"
+    /// A CloudKit zone was deleted or purged.
+    case zoneDeletion = "handleFetchedDatabaseChanges.deleteZone"
+  }
+
+  /// What the ``SyncEngine`` did about a reported error.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public enum SyncEngineErrorDisposition: Sendable, Equatable {
+    /// The engine took corrective action (for example, merged a server record) and re-enqueued
+    /// the change.
+    case recoveredAndRetried
+    /// The change remains pending and will be retried later (for example, after a backoff
+    /// interval elapses).
+    case transientPendingRetry
+    /// The change was dropped or reconciled to the server's state and will not be retried
+    /// automatically.
+    case terminalDroppedOrReconciled
+  }
+
   /// Context describing an internal ``SyncEngine`` error that was caught and reported by
   /// SQLiteData.
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   public struct SyncEngineErrorContext: Sendable {
     public let operation: String
+    public let operationKind: SyncEngineOperation?
+    public let disposition: SyncEngineErrorDisposition?
     public let tableName: String?
     public let recordType: String?
     public let isRemoteDelete: Bool
     public let isLocalSaveFailure: Bool
     public let isLocalDeleteFailure: Bool
+
+    public init(
+      operation: SyncEngineOperation,
+      disposition: SyncEngineErrorDisposition,
+      tableName: String? = nil,
+      recordType: String? = nil,
+      isRemoteDelete: Bool = false,
+      isLocalSaveFailure: Bool = false,
+      isLocalDeleteFailure: Bool = false
+    ) {
+      self.operation = operation.rawValue
+      self.operationKind = operation
+      self.disposition = disposition
+      self.tableName = tableName
+      self.recordType = recordType
+      self.isRemoteDelete = isRemoteDelete
+      self.isLocalSaveFailure = isLocalSaveFailure
+      self.isLocalDeleteFailure = isLocalDeleteFailure
+    }
 
     public init(
       operation: String,
@@ -23,11 +73,31 @@
       isLocalDeleteFailure: Bool = false
     ) {
       self.operation = operation
+      self.operationKind = SyncEngineOperation(rawValue: operation)
+      self.disposition = nil
       self.tableName = tableName
       self.recordType = recordType
       self.isRemoteDelete = isRemoteDelete
       self.isLocalSaveFailure = isLocalSaveFailure
       self.isLocalDeleteFailure = isLocalDeleteFailure
+    }
+  }
+
+  /// Context emitted before a remote zone deletion or purge is mirrored into local storage.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public struct SyncEngineZoneDeletionContext: Sendable {
+    public let zoneID: CKRecordZone.ID
+    public let reason: CKDatabase.DatabaseChange.Deletion.Reason
+    public let recordCountsByType: [String: Int]
+
+    public init(
+      zoneID: CKRecordZone.ID,
+      reason: CKDatabase.DatabaseChange.Deletion.Reason,
+      recordCountsByType: [String: Int]
+    ) {
+      self.zoneID = zoneID
+      self.reason = reason
+      self.recordCountsByType = recordCountsByType
     }
   }
 
@@ -118,6 +188,12 @@
       didReportError error: any Error,
       context: SyncEngineErrorContext
     ) async
+
+    /// Called before a remote zone deletion or purge is mirrored into a broad local delete.
+    func syncEngine(
+      _ syncEngine: SyncEngine,
+      willDeleteLocalRecords context: SyncEngineZoneDeletionContext
+    ) async
   }
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
@@ -142,6 +218,11 @@
       _ syncEngine: SyncEngine,
       didReportError error: any Error,
       context: SyncEngineErrorContext
+    ) async {}
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine,
+      willDeleteLocalRecords context: SyncEngineZoneDeletionContext
     ) async {}
   }
 #endif

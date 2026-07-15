@@ -7,13 +7,16 @@
   import SQLiteData
   import SnapshotTestingCustomDump
   import Testing
+  import TestLocals
 
   extension BaseCloudKitTests {
     @MainActor
     @Suite
     final class FetchedDatabaseChangesTests: BaseCloudKitTests, @unchecked Sendable {
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func deleteSyncEngineZone() async throws {
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func deleteSyncEngineZone() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -33,6 +36,13 @@
           deleting: [syncEngine.defaultZone.zoneID]
         ).notify()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
+
+        let zoneDeletion = try #require(delegate.zoneDeletions.withValue { $0.first })
+        #expect(zoneDeletion.zoneID == syncEngine.defaultZone.zoneID)
+        #expect(zoneDeletion.reason == .deleted)
+        #expect(zoneDeletion.recordCountsByType[RemindersList.tableName] == 2)
+        #expect(zoneDeletion.recordCountsByType[Reminder.tableName] == 2)
+        #expect(zoneDeletion.recordCountsByType[RemindersListPrivate.tableName] == 2)
 
         try await userDatabase.read { db in
           try #expect(Reminder.all.fetchAll(db) == [])
