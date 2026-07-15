@@ -14,6 +14,8 @@
     package struct State {
       private var lastRecordChangeTag = 0
       package var storage: [CKRecordZone.ID: Zone] = [:]
+      var nextRecordSaveErrorCodes: [CKRecord.ID: CKError.Code] = [:]
+      var nextRecordDeleteErrorCodes: [CKRecord.ID: CKError.Code] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
       mutating func nextRecordChangeTag() -> Int {
@@ -38,6 +40,20 @@
 
     package func set(container: MockCloudContainer) {
       _container.set(container)
+    }
+
+    package func failNextSave(
+      for recordID: CKRecord.ID,
+      with errorCode: CKError.Code
+    ) {
+      state.withValue { $0.nextRecordSaveErrorCodes[recordID] = errorCode }
+    }
+
+    package func failNextDelete(
+      for recordID: CKRecord.ID,
+      with errorCode: CKError.Code
+    ) {
+      state.withValue { $0.nextRecordDeleteErrorCodes[recordID] = errorCode }
     }
 
     package var container: MockCloudContainer {
@@ -146,6 +162,21 @@
             let existingRecord = state.storage[recordToSave.recordID.zoneID]?.records[
               recordToSave.recordID
             ]
+
+            if let errorCode = state.nextRecordSaveErrorCodes.removeValue(
+              forKey: recordToSave.recordID
+            ) {
+              var userInfo: [String: Any] = [
+                CKRecordChangedErrorClientRecordKey: recordToSave.copy()
+              ]
+              if let existingRecord {
+                userInfo[CKRecordChangedErrorServerRecordKey] = existingRecord.copy()
+              }
+              saveResults[recordToSave.recordID] = .failure(
+                CKError(errorCode, userInfo: userInfo)
+              )
+              continue
+            }
 
             func saveRecordToDatabase() {
               let hasReferenceViolation =
@@ -267,6 +298,12 @@
           fatalError()
         }
         for recordIDToDelete in recordIDsToDelete {
+          if let errorCode = state.nextRecordDeleteErrorCodes.removeValue(
+            forKey: recordIDToDelete
+          ) {
+            deleteResults[recordIDToDelete] = .failure(CKError(errorCode))
+            continue
+          }
           guard state.storage[recordIDToDelete.zoneID] != nil
           else {
             deleteResults[recordIDToDelete] = .failure(CKError(.zoneNotFound))

@@ -175,7 +175,6 @@
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
       }
 
-
       @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
       func reportedError_RemoteDeleteForeignKeyFailure() async throws {
         let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
@@ -216,6 +215,140 @@
         try await userDatabase.read { db in
           try #expect(Parent.find(1).fetchOne(db) != nil)
         }
+      }
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func reportedError_RejectedLocalRelationshipSaveIsRecovered() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Fallback")
+            RemindersList(id: 2, title: "Restored")
+            Reminder(id: 1, title: "Original", remindersListID: 1)
+            Tag(title: "relationship-recovery-row")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await withDependencies {
+          $0.currentTime.now += 1
+        } operation: {
+          try await userDatabase.userWrite { db in
+            try Reminder.find(1).update { $0.remindersListID = 2 }.execute(db)
+            try Tag.find("relationship-recovery-row").delete().execute(db)
+          }
+        }
+
+        syncEngine.private.database.failNextSave(
+          for: Reminder.recordID(for: 1),
+          with: .serverRejectedRequest
+        )
+        try await syncEngine.processPendingRecordZoneChanges(
+          scope: .private,
+          forceAtomicByZone: false
+        )
+
+        try await withDependencies {
+          $0.currentTime.now += 1
+        } operation: {
+          let remoteReminder = try syncEngine.private.database.record(
+            for: Reminder.recordID(for: 1)
+          )
+          remoteReminder.setValue("Remote title", forKey: "title", at: now)
+          try await syncEngine.modifyRecords(scope: .private, saving: [remoteReminder]).notify()
+        }
+
+        let localReminder = try await userDatabase.read { db in
+          let reminder = try Reminder.find(1).fetchOne(db)
+          return try #require(reminder)
+        }
+        #expect(localReminder.remindersListID == 2)
+        #expect(localReminder.title == "Remote title")
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        let serverReminder = try syncEngine.private.database.record(
+          for: Reminder.recordID(for: 1)
+        )
+        #expect(serverReminder.parent?.recordID == RemindersList.recordID(for: 2))
+        #expect(throws: CKError.self) {
+          try syncEngine.private.database.record(
+            for: Tag.recordID(for: "relationship-recovery-row")
+          )
+        }
+
+        let reportedError = try #require(delegate.reportedErrors.withValue { $0.first })
+        #expect((reportedError.error as? CKError)?.code == .serverRejectedRequest)
+        #expect(reportedError.context.operation == "handleSentRecordZoneChanges.saveRecords")
+        #expect(reportedError.context.tableName == Reminder.tableName)
+        #expect(reportedError.context.recordType == Reminder.tableName)
+        #expect(reportedError.context.isLocalSaveFailure)
+      }
+
+      @Test
+      func transientLocalSaveAndDeleteFailuresAreRetried() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Original")
+            Tag(title: "delete-me")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).update { $0.title = "Updated" }.execute(db)
+          try Tag.find("delete-me").delete().execute(db)
+        }
+        syncEngine.private.database.failNextSave(
+          for: RemindersList.recordID(for: 1),
+          with: .networkFailure
+        )
+        syncEngine.private.database.failNextDelete(
+          for: Tag.recordID(for: "delete-me"),
+          with: .networkFailure
+        )
+
+        try await syncEngine.processPendingRecordZoneChanges(
+          scope: .private,
+          forceAtomicByZone: false
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        let serverList = try syncEngine.private.database.record(
+          for: RemindersList.recordID(for: 1)
+        )
+        #expect(serverList.encryptedValues["title"] as? String == "Updated")
+        #expect(throws: CKError.self) {
+          try syncEngine.private.database.record(for: Tag.recordID(for: "delete-me"))
+        }
+      }
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func terminalLocalDeleteFailureIsReported() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            Tag(title: "delete-me")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.userWrite { db in
+          try Tag.find("delete-me").delete().execute(db)
+        }
+        syncEngine.private.database.failNextDelete(
+          for: Tag.recordID(for: "delete-me"),
+          with: .serverRejectedRequest
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        _ = try syncEngine.private.database.record(for: Tag.recordID(for: "delete-me"))
+        let reportedError = try #require(delegate.reportedErrors.withValue { $0.first })
+        #expect((reportedError.error as? CKError)?.code == .serverRejectedRequest)
+        #expect(reportedError.context.operation == "handleSentRecordZoneChanges.deleteRecords")
+        #expect(reportedError.context.tableName == Tag.tableName)
+        #expect(reportedError.context.recordType == Tag.tableName)
+        #expect(reportedError.context.isLocalDeleteFailure)
       }
 
       @Test($syncEngineDelegate.set(DefaultImplementationDelegate()))

@@ -1685,6 +1685,19 @@
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
       for (failedRecord, error) in failedRecordSaves {
+        func reportLocalSaveFailure() async {
+          await delegate?.syncEngine(
+            self,
+            didReportError: error,
+            context: SyncEngineErrorContext(
+              operation: "handleSentRecordZoneChanges.saveRecords",
+              tableName: tablesByName[failedRecord.recordType]?.base.tableName,
+              recordType: failedRecord.recordType,
+              isLocalSaveFailure: true
+            )
+          )
+        }
+
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
             try await userDatabase.write { db in
@@ -1697,7 +1710,10 @@
         }
 
         switch error.code {
-        case .serverRecordChanged:
+        case .serverRecordChanged, .serverRejectedRequest:
+          if error.code == .serverRejectedRequest {
+            await reportLocalSaveFailure()
+          }
           guard let serverRecord = error.serverRecord else { continue }
           await upsertFromServerRecord(serverRecord)
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
@@ -1710,9 +1726,6 @@
 
         case .unknownItem:
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
-          await clearServerRecord()
-
-        case .serverRejectedRequest:
           await clearServerRecord()
 
         case .referenceViolation:
@@ -1806,27 +1819,36 @@
           break
 
         case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
-          .notAuthenticated, .operationCancelled,
-          .internalError, .partialFailure, .badContainer, .requestRateLimited, .missingEntitlement,
-          .invalidArguments, .resultsTruncated, .assetFileNotFound,
-          .assetFileModified, .incompatibleVersion, .constraintViolation, .changeTokenExpired,
-          .badDatabase, .quotaExceeded, .limitExceeded, .userDeletedZone, .tooManyParticipants,
-          .alreadyShared, .managedAccountRestricted, .participantMayNeedVerification,
-          .serverResponseLost, .assetNotAvailable, .accountTemporarilyUnavailable:
-          continue
+          .notAuthenticated, .operationCancelled, .internalError, .partialFailure,
+          .requestRateLimited, .resultsTruncated, .changeTokenExpired, .serverResponseLost,
+          .assetNotAvailable, .accountTemporarilyUnavailable:
+          newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+
+        case .userDeletedZone:
+          let zone = CKRecordZone(zoneID: failedRecord.recordID.zoneID)
+          newPendingDatabaseChanges.append(.saveZone(zone))
+          newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+          await clearServerRecord()
+
+        case .badContainer, .missingEntitlement, .invalidArguments, .assetFileNotFound,
+          .assetFileModified, .incompatibleVersion, .constraintViolation, .badDatabase,
+          .quotaExceeded, .limitExceeded, .tooManyParticipants, .alreadyShared,
+          .managedAccountRestricted, .participantMayNeedVerification:
+          await reportLocalSaveFailure()
         #if canImport(FoundationModels)
           case .participantAlreadyInvited:
-            continue
+            await reportLocalSaveFailure()
         #endif
         @unknown default:
-          continue
+          await reportLocalSaveFailure()
         }
       }
 
-      let enqueuedUnsyncedRecordID =
+      let failedDeleteHandling =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await userDatabase.write { db in
             var enqueuedUnsyncedRecordID = false
+            var terminalFailures: [(recordID: CKRecord.ID, error: CKError)] = []
             for (failedRecordID, error) in failedRecordDeletes {
               switch error.code {
               case .referenceViolation:
@@ -1843,27 +1865,47 @@
                 break
               case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
                 .notAuthenticated, .operationCancelled, .internalError, .partialFailure,
-                .badContainer, .requestRateLimited, .missingEntitlement, .invalidArguments,
-                .resultsTruncated, .assetFileNotFound, .assetFileModified, .incompatibleVersion,
-                .constraintViolation, .changeTokenExpired, .badDatabase, .quotaExceeded,
-                .limitExceeded, .userDeletedZone, .tooManyParticipants, .alreadyShared,
-                .managedAccountRestricted, .participantMayNeedVerification, .serverResponseLost,
-                .assetNotAvailable, .accountTemporarilyUnavailable, .permissionFailure,
-                .unknownItem, .serverRecordChanged, .serverRejectedRequest, .zoneNotFound:
+                .requestRateLimited, .resultsTruncated, .changeTokenExpired,
+                .serverResponseLost, .assetNotAvailable, .accountTemporarilyUnavailable,
+                .serverRecordChanged:
+                syncEngine.state.add(pendingRecordZoneChanges: [.deleteRecord(failedRecordID)])
+                break
+              case .badContainer, .missingEntitlement, .invalidArguments, .assetFileNotFound,
+                .assetFileModified, .incompatibleVersion, .constraintViolation, .badDatabase,
+                .quotaExceeded, .limitExceeded, .tooManyParticipants, .alreadyShared,
+                .managedAccountRestricted, .participantMayNeedVerification, .permissionFailure,
+                .serverRejectedRequest:
+                terminalFailures.append((failedRecordID, error))
+                break
+              case .userDeletedZone, .unknownItem, .zoneNotFound:
                 break
               #if canImport(FoundationModels)
                 case .participantAlreadyInvited:
+                  terminalFailures.append((failedRecordID, error))
                   break
               #endif
               @unknown default:
+                terminalFailures.append((failedRecordID, error))
                 break
               }
             }
-            return enqueuedUnsyncedRecordID
+            return (enqueuedUnsyncedRecordID, terminalFailures)
           }
         }
-        ?? false
-      if enqueuedUnsyncedRecordID {
+      for (recordID, error) in failedDeleteHandling?.1 ?? [] {
+        let recordType = recordID.tableName
+        await delegate?.syncEngine(
+          self,
+          didReportError: error,
+          context: SyncEngineErrorContext(
+            operation: "handleSentRecordZoneChanges.deleteRecords",
+            tableName: recordType.flatMap { tablesByName[$0]?.base.tableName },
+            recordType: recordType,
+            isLocalDeleteFailure: true
+          )
+        )
+      }
+      if failedDeleteHandling?.0 == true {
         await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
       }
     }

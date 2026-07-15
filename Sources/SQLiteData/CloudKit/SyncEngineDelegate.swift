@@ -11,17 +11,23 @@
     public let tableName: String?
     public let recordType: String?
     public let isRemoteDelete: Bool
+    public let isLocalSaveFailure: Bool
+    public let isLocalDeleteFailure: Bool
 
     public init(
       operation: String,
       tableName: String? = nil,
       recordType: String? = nil,
-      isRemoteDelete: Bool = false
+      isRemoteDelete: Bool = false,
+      isLocalSaveFailure: Bool = false,
+      isLocalDeleteFailure: Bool = false
     ) {
       self.operation = operation
       self.tableName = tableName
       self.recordType = recordType
       self.isRemoteDelete = isRemoteDelete
+      self.isLocalSaveFailure = isLocalSaveFailure
+      self.isLocalDeleteFailure = isLocalDeleteFailure
     }
   }
 
