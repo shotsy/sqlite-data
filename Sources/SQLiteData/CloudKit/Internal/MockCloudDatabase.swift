@@ -12,9 +12,14 @@
     let dataManager = Dependency(\.dataManager)
 
     package struct State {
+      struct InjectedRecordSaveError {
+        let code: CKError.Code
+        let includesServerRecord: Bool
+      }
+
       private var lastRecordChangeTag = 0
       package var storage: [CKRecordZone.ID: Zone] = [:]
-      var nextRecordSaveErrorCodes: [CKRecord.ID: CKError.Code] = [:]
+      var nextRecordSaveErrors: [CKRecord.ID: InjectedRecordSaveError] = [:]
       var nextRecordDeleteErrorCodes: [CKRecord.ID: CKError.Code] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
@@ -44,9 +49,15 @@
 
     package func failNextSave(
       for recordID: CKRecord.ID,
-      with errorCode: CKError.Code
+      with errorCode: CKError.Code,
+      includesServerRecord: Bool = true
     ) {
-      state.withValue { $0.nextRecordSaveErrorCodes[recordID] = errorCode }
+      state.withValue {
+        $0.nextRecordSaveErrors[recordID] = State.InjectedRecordSaveError(
+          code: errorCode,
+          includesServerRecord: includesServerRecord
+        )
+      }
     }
 
     package func failNextDelete(
@@ -163,17 +174,17 @@
               recordToSave.recordID
             ]
 
-            if let errorCode = state.nextRecordSaveErrorCodes.removeValue(
+            if let injectedError = state.nextRecordSaveErrors.removeValue(
               forKey: recordToSave.recordID
             ) {
               var userInfo: [String: Any] = [
                 CKRecordChangedErrorClientRecordKey: recordToSave.copy()
               ]
-              if let existingRecord {
+              if injectedError.includesServerRecord, let existingRecord {
                 userInfo[CKRecordChangedErrorServerRecordKey] = existingRecord.copy()
               }
               saveResults[recordToSave.recordID] = .failure(
-                CKError(errorCode, userInfo: userInfo)
+                CKError(injectedError.code, userInfo: userInfo)
               )
               continue
             }

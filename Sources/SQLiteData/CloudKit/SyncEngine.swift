@@ -1825,10 +1825,7 @@
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
 
         case .userDeletedZone:
-          let zone = CKRecordZone(zoneID: failedRecord.recordID.zoneID)
-          newPendingDatabaseChanges.append(.saveZone(zone))
-          newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
-          await clearServerRecord()
+          await reportLocalSaveFailure()
 
         case .badContainer, .missingEntitlement, .invalidArguments, .assetFileNotFound,
           .assetFileModified, .incompatibleVersion, .constraintViolation, .badDatabase,

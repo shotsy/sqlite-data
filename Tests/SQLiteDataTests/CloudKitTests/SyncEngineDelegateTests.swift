@@ -5,6 +5,7 @@
   import DependenciesTestSupport
   import Foundation
   import InlineSnapshotTesting
+  import OrderedCollections
   import SQLiteData
   import SQLiteDataTestSupport
   import SnapshotTestingCustomDump
@@ -283,6 +284,93 @@
         #expect(reportedError.context.tableName == Reminder.tableName)
         #expect(reportedError.context.recordType == Reminder.tableName)
         #expect(reportedError.context.isLocalSaveFailure)
+      }
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func rejectedLocalSaveWithoutServerRecordPreservesMergeBaseline() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Fallback")
+            RemindersList(id: 2, title: "Restored")
+            Reminder(id: 1, title: "Original", remindersListID: 1)
+            Tag(title: "relationship-recovery-row")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await withDependencies {
+          $0.currentTime.now += 1
+        } operation: {
+          try await userDatabase.userWrite { db in
+            try Reminder.find(1).update { $0.remindersListID = 2 }.execute(db)
+            try Tag.find("relationship-recovery-row").delete().execute(db)
+          }
+        }
+
+        syncEngine.private.database.failNextSave(
+          for: Reminder.recordID(for: 1),
+          with: .serverRejectedRequest,
+          includesServerRecord: false
+        )
+        try await syncEngine.processPendingRecordZoneChanges(
+          scope: .private,
+          forceAtomicByZone: false
+        )
+
+        try await withDependencies {
+          $0.currentTime.now += 1
+        } operation: {
+          let remoteReminder = try syncEngine.private.database.record(
+            for: Reminder.recordID(for: 1)
+          )
+          remoteReminder.setValue("Remote title", forKey: "title", at: now)
+          try await syncEngine.modifyRecords(scope: .private, saving: [remoteReminder]).notify()
+        }
+
+        let localReminder = try await userDatabase.read { db in
+          let reminder = try Reminder.find(1).fetchOne(db)
+          return try #require(reminder)
+        }
+        #expect(localReminder.remindersListID == 2)
+        #expect(localReminder.title == "Remote title")
+        #expect(throws: CKError.self) {
+          try syncEngine.private.database.record(
+            for: Tag.recordID(for: "relationship-recovery-row")
+          )
+        }
+
+        let reportedError = try #require(delegate.reportedErrors.withValue { $0.first })
+        #expect((reportedError.error as? CKError)?.code == .serverRejectedRequest)
+        #expect(reportedError.context.recordType == Reminder.tableName)
+        #expect(reportedError.context.isLocalSaveFailure)
+      }
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func userDeletedZoneSaveIsReportedWithoutRecreatingZone() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Original")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).update { $0.title = "Updated" }.execute(db)
+        }
+        syncEngine.private.database.failNextSave(
+          for: RemindersList.recordID(for: 1),
+          with: .userDeletedZone
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        let reportedError = try #require(delegate.reportedErrors.withValue { $0.first })
+        #expect((reportedError.error as? CKError)?.code == .userDeletedZone)
+        #expect(reportedError.context.recordType == RemindersList.tableName)
+        #expect(reportedError.context.isLocalSaveFailure)
+        syncEngine.private.state.assertPendingDatabaseChanges([])
+        syncEngine.private.state.assertPendingRecordZoneChanges([])
       }
 
       @Test
