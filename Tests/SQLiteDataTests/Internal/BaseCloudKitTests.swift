@@ -99,6 +99,7 @@ import TestLocals
     }
 
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    @MainActor
     func signOut() async {
       container._accountStatus.withValue { $0 = .noAccount }
       await syncEngine.handleEvent(
