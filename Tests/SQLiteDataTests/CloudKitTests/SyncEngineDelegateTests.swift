@@ -294,8 +294,7 @@
           try #expect(UnsyncedRecordID.count().fetchOne(db) == 2)
         }
 
-        syncEngine.private.state.changeTag.withValue { $0 = .max }
-        try await syncEngine.fetchChanges()
+        await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
 
         try await userDatabase.read { db in
           try #expect(RemindersList.find(1).fetchOne(db)?.title == "Remote 1")

@@ -1054,6 +1054,7 @@
         await MainActor.run {
           fetchingChangesCount -= 1
         }
+        await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
 
       case .willSendChanges:
         await MainActor.run {
