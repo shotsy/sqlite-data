@@ -573,6 +573,8 @@
       async let `private`: Void = privateSyncEngine.fetchChanges(options)
       async let shared: Void = sharedSyncEngine.fetchChanges(options)
       _ = try await (`private`, shared)
+      await handleFetchedRecordZoneChanges(syncEngine: privateSyncEngine)
+      await handleFetchedRecordZoneChanges(syncEngine: sharedSyncEngine)
     }
 
     /// Sends pending local changes to the server.
@@ -1607,6 +1609,10 @@
               try UnsyncedRecordID.all
                 .fetchAll(db)
                 .map(CKRecord.ID.init(unsyncedRecordID:))
+                .filter {
+                  (syncEngine.database.databaseScope == .private)
+                    == ($0.zoneID.ownerName == CKCurrentUserDefaultName)
+                }
             )
           }
           let modificationRecordIDs = Set(applicableModifications.map(\.recordID))
@@ -1665,7 +1671,7 @@
         case reference(CKShare.Reference)
       }
       var shares: [ShareOrReference] = []
-      for record in modifications {
+      for (index, record) in modifications.enumerated() {
         if let share = record as? CKShare {
           shares.append(.share(share))
         } else {
@@ -1673,6 +1679,40 @@
             try await userDatabase.write { db in
               try upsertFromServerRecord(record, db: db)
             }
+          } catch let error as CancellationError {
+            let recordIDs =
+              shares.map {
+                switch $0 {
+                case .share(let share):
+                  share.recordID
+                case .reference(let reference):
+                  reference.recordID
+                }
+              }
+              + modifications[index...].map(\.recordID)
+            await Task {
+              await withErrorReporting(.sqliteDataCloudKitFailure) {
+                try await userDatabase.write { db in
+                  try UnsyncedRecordID.insert {
+                    recordIDs.map { UnsyncedRecordID(recordID: $0) }
+                  } onConflictDoUpdate: { _ in
+                  }
+                  .execute(db)
+                }
+              }
+            }
+            .value
+            await delegate?.syncEngine(
+              self,
+              didReportError: error,
+              context: SyncEngineErrorContext(
+                operation: .fetchedRecordApplication,
+                disposition: .transientPendingRetry,
+                tableName: tablesByName[record.recordType]?.base.tableName,
+                recordType: record.recordType
+              )
+            )
+            return
           } catch {
             await delegate?.syncEngine(
               self,
@@ -1699,6 +1739,9 @@
             case .share(let share):
               await withErrorReporting(.sqliteDataCloudKitFailure) {
                 try await self.cacheShare(share)
+                try await self.userDatabase.write { db in
+                  try UnsyncedRecordID.find(share.recordID).delete().execute(db)
+                }
               }
             case .reference(let shareReference):
               guard

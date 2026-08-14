@@ -257,6 +257,56 @@
       }
 
       @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func cancelledFetchedRecordApplicationsAreRetried() async throws {
+        let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Local 1")
+            RemindersList(id: 2, title: "Local 2")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        let remoteRecords = try [1, 2].map { id in
+          let record = try syncEngine.private.database.record(
+            for: RemindersList.recordID(for: id)
+          )
+          record.setValue("Remote \(id)", forKey: "title", at: now + 1)
+          return record
+        }
+        let modifications = try syncEngine.modifyRecords(
+          scope: .private,
+          saving: remoteRecords
+        )
+
+        let cancelledFetch = Task {
+          withUnsafeCurrentTask { $0?.cancel() }
+          await modifications.notify()
+        }
+        await cancelledFetch.value
+
+        #expect(delegate.reportedErrors.withValue(\.count) == 1)
+        let reportedError = try #require(delegate.reportedErrors.withValue { $0.first })
+        #expect(reportedError.error is CancellationError)
+        #expect(reportedError.context.operationKind == .fetchedRecordApplication)
+        #expect(reportedError.context.disposition == .transientPendingRetry)
+        try await syncEngine.metadatabase.read { db in
+          try #expect(UnsyncedRecordID.count().fetchOne(db) == 2)
+        }
+
+        syncEngine.private.state.changeTag.withValue { $0 = .max }
+        try await syncEngine.fetchChanges()
+
+        try await userDatabase.read { db in
+          try #expect(RemindersList.find(1).fetchOne(db)?.title == "Remote 1")
+          try #expect(RemindersList.find(2).fetchOne(db)?.title == "Remote 2")
+        }
+        try await syncEngine.metadatabase.read { db in
+          try #expect(UnsyncedRecordID.count().fetchOne(db) == 0)
+        }
+      }
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
       func reportedError_RejectedLocalRelationshipSaveIsRecovered() async throws {
         let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
         try await userDatabase.userWrite { db in
