@@ -51,7 +51,8 @@ import TestLocals
       self.userDatabase = UserDatabase(
         database: try SQLiteDataTests.database(
           containerIdentifier: testContainerIdentifier,
-          attachMetadatabase: attachMetadatabase
+          attachMetadatabase: attachMetadatabase,
+          observesSuspensionNotifications: observesSuspensionNotifications
         )
       )
       try await prepareDatabase(userDatabase)
