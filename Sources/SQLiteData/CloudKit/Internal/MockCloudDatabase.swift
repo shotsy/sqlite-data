@@ -23,6 +23,7 @@
       var nextRecordDeleteErrorCodes: [CKRecord.ID: CKError.Code] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
+      package var expireNextZoneChangesToken = false
       mutating func nextRecordChangeTag() -> Int {
         lastRecordChangeTag += 1
         return lastRecordChangeTag
@@ -436,6 +437,49 @@
         }
 
         return (saveResults: saveResults, deleteResults: deleteResults)
+      }
+    }
+
+    /// Stateless mock of raw zone changes: the token records which record tags were already
+    /// delivered, so later pages return new or changed records and deletions since then.
+    package func zoneChangesPage(
+      in zoneID: CKRecordZone.ID,
+      since changeToken: Data?,
+      desiredKeys: [CKRecord.FieldKey]?,
+      resultsLimit: Int
+    ) throws -> ZoneChangesPage {
+      let accountStatus = container.accountStatus()
+      guard accountStatus == .available
+      else { throw ckError(forAccountStatus: accountStatus) }
+      let previouslyDelivered = try changeToken.map {
+        try JSONDecoder().decode([String: Int].self, from: $0)
+      } ?? [:]
+      return try state.withValue { state in
+        var delivered = previouslyDelivered
+        if changeToken != nil, state.expireNextZoneChangesToken {
+          state.expireNextZoneChangesToken = false
+          throw CKError(.changeTokenExpired)
+        }
+        guard let zone = state.storage[zoneID] else { throw CKError(.zoneNotFound) }
+        let changed = zone.records.values
+          .filter { delivered[$0.recordID.recordName] != ($0._recordChangeTag ?? 0) }
+          .sorted { $0.recordID.recordName < $1.recordID.recordName }
+        let deletions = delivered.keys
+          .filter { zone.records[CKRecord.ID(recordName: $0, zoneID: zoneID)] == nil }
+          .sorted()
+          .map { CKRecord.ID(recordName: $0, zoneID: zoneID) }
+        for recordID in deletions { delivered[recordID.recordName] = nil }
+        var modifications: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
+        for record in changed.prefix(resultsLimit) {
+          delivered[record.recordID.recordName] = record._recordChangeTag ?? 0
+          modifications[record.recordID] = .success(record.copy() as! CKRecord)
+        }
+        return ZoneChangesPage(
+          modifications: modifications,
+          deletions: deletions,
+          changeToken: try JSONEncoder().encode(delivered),
+          moreComing: changed.count > resultsLimit
+        )
       }
     }
 
