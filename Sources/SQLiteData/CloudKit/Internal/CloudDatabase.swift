@@ -31,6 +31,52 @@
       saveResults: [CKRecordZone.ID: Result<CKRecordZone, any Error>],
       deleteResults: [CKRecordZone.ID: Result<Void, any Error>]
     )
+
+    /// One page of raw zone changes. The token is an archived `CKServerChangeToken` so it can
+    /// be persisted; `nil` starts from the beginning of the zone.
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    func zoneChangesPage(
+      in zoneID: CKRecordZone.ID,
+      since changeToken: Data?,
+      desiredKeys: [CKRecord.FieldKey]?,
+      resultsLimit: Int
+    ) async throws -> ZoneChangesPage
+  }
+
+  package struct ZoneChangesPage: Sendable {
+    package var modifications: [CKRecord.ID: Result<CKRecord, any Error>]
+    package var deletions: [CKRecord.ID]
+    package var changeToken: Data
+    package var moreComing: Bool
+  }
+
+  extension CKDatabase {
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    package func zoneChangesPage(
+      in zoneID: CKRecordZone.ID,
+      since changeToken: Data?,
+      desiredKeys: [CKRecord.FieldKey]?,
+      resultsLimit: Int
+    ) async throws -> ZoneChangesPage {
+      let token = try changeToken.flatMap {
+        try NSKeyedUnarchiver.unarchivedObject(ofClass: CKServerChangeToken.self, from: $0)
+      }
+      let changes = try await recordZoneChanges(
+        inZoneWith: zoneID,
+        since: token,
+        desiredKeys: desiredKeys,
+        resultsLimit: resultsLimit
+      )
+      return ZoneChangesPage(
+        modifications: changes.modificationResultsByID.mapValues { $0.map(\.record) },
+        deletions: changes.deletions.map(\.recordID),
+        changeToken: try NSKeyedArchiver.archivedData(
+          withRootObject: changes.changeToken,
+          requiringSecureCoding: true
+        ),
+        moreComing: changes.moreComing
+      )
+    }
   }
 
   extension CloudDatabase {
@@ -110,6 +156,17 @@
     ) {
       try await rawValue.modifyRecordZones(
         saving: recordZonesToSave, deleting: recordZoneIDsToDelete)
+    }
+
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    func zoneChangesPage(
+      in zoneID: CKRecordZone.ID,
+      since changeToken: Data?,
+      desiredKeys: [CKRecord.FieldKey]?,
+      resultsLimit: Int
+    ) async throws -> ZoneChangesPage {
+      try await rawValue.zoneChangesPage(
+        in: zoneID, since: changeToken, desiredKeys: desiredKeys, resultsLimit: resultsLimit)
     }
 
     static func == (lhs: AnyCloudDatabase, rhs: AnyCloudDatabase) -> Bool {

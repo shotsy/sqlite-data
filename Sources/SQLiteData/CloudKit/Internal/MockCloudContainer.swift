@@ -6,6 +6,7 @@
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   package final class MockCloudContainer: CloudContainer {
     package let _accountStatus: LockIsolated<CKAccountStatus>
+    package let _userRecordID = LockIsolated(CKRecord.ID(recordName: "defaultCurrentUser"))
     package let containerIdentifier: String?
     package let privateCloudDatabase: MockCloudDatabase
     package let sharedCloudDatabase: MockCloudDatabase
@@ -38,6 +39,11 @@
 
     package func accountStatus() async throws -> CKAccountStatus {
       _accountStatus.withValue { $0 }
+    }
+
+    package func userRecordID() async throws -> CKRecord.ID {
+      guard _accountStatus.value == .available else { throw CKError(.notAuthenticated) }
+      return _userRecordID.value
     }
 
     package func shareMetadata(
