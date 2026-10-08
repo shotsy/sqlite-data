@@ -42,7 +42,6 @@
     let dataManager = Dependency(\.dataManager)
     private let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
-    private let activityCounts = LockIsolated(ActivityCounts())
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
@@ -436,8 +435,12 @@
         }
       #endif
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          $0 = SyncEngines()
+        observationRegistrar.withMutation(of: self, keyPath: \.isSendingChanges) {
+          observationRegistrar.withMutation(of: self, keyPath: \.isFetchingChanges) {
+            syncEngines.withValue {
+              $0 = SyncEngines()
+            }
+          }
         }
       }
     }
@@ -925,24 +928,49 @@
     }
 
     private var sendingChangesCount: Int {
-      get {
-        observationRegistrar.access(self, keyPath: \.isSendingChanges)
-        return activityCounts.withValue(\.sendingChangesCount)
-      }
-      set {
-        observationRegistrar.withMutation(of: self, keyPath: \.isSendingChanges) {
-          activityCounts.withValue { $0.sendingChangesCount = newValue }
-        }
+      observationRegistrar.access(self, keyPath: \.isSendingChanges)
+      return syncEngines.withValue {
+        $0.activityCounts.values.reduce(0) { $0 + $1[.sending, default: 0] }
       }
     }
     private var fetchingChangesCount: Int {
-      get {
-        observationRegistrar.access(self, keyPath: \.isFetchingChanges)
-        return activityCounts.withValue(\.fetchingChangesCount)
+      observationRegistrar.access(self, keyPath: \.isFetchingChanges)
+      return syncEngines.withValue {
+        $0.activityCounts.values.reduce(0) { total, counts in
+          total + counts.reduce(0) { $0 + ($1.key == .sending ? 0 : $1.value) }
+        }
       }
-      set {
-        observationRegistrar.withMutation(of: self, keyPath: \.isFetchingChanges) {
-          activityCounts.withValue { $0.fetchingChangesCount = newValue }
+    }
+
+    // Kept separate from CKSyncEngine.Event so send activity can be tested without
+    // constructing an SDK-owned SendChangesContext.
+    package enum Activity: Hashable, Sendable {
+      case sending
+      case fetching
+      case fetchingZone(CKRecordZone.ID)
+    }
+
+    @MainActor
+    package func updateActivity(
+      _ activity: Activity,
+      isStarting: Bool,
+      syncEngine: any SyncEngineProtocol
+    ) {
+      let keyPath = activity == .sending ? \SyncEngine.isSendingChanges : \SyncEngine.isFetchingChanges
+      observationRegistrar.withMutation(of: self, keyPath: keyPath) {
+        syncEngines.withValue { engines in
+          // Check identity and mutate under the same lock as stop/start. A callback
+          // can reach MainActor after its engine has already been replaced.
+          guard engines.private === syncEngine || engines.shared === syncEngine else { return }
+          let id = ObjectIdentifier(syncEngine)
+          let count = engines.activityCounts[id]?[activity] ?? 0
+          if isStarting {
+            engines.activityCounts[id, default: [:]][activity] = count + 1
+          } else if count > 1 {
+            engines.activityCounts[id]?[activity] = count - 1
+          } else {
+            engines.activityCounts[id]?[activity] = nil
+          }
         }
       }
     }
@@ -1037,33 +1065,21 @@
           syncEngine: syncEngine
         )
 
-      case .willFetchRecordZoneChanges:
-        await MainActor.run {
-          fetchingChangesCount += 1
-        }
-      case .didFetchRecordZoneChanges:
-        await MainActor.run {
-          fetchingChangesCount -= 1
-        }
+      case .willFetchRecordZoneChanges(let zoneID):
+        await updateActivity(.fetchingZone(zoneID), isStarting: true, syncEngine: syncEngine)
+      case .didFetchRecordZoneChanges(let zoneID, _):
+        await updateActivity(.fetchingZone(zoneID), isStarting: false, syncEngine: syncEngine)
 
       case .willFetchChanges:
-        await MainActor.run {
-          fetchingChangesCount += 1
-        }
+        await updateActivity(.fetching, isStarting: true, syncEngine: syncEngine)
       case .didFetchChanges:
-        await MainActor.run {
-          fetchingChangesCount -= 1
-        }
+        await updateActivity(.fetching, isStarting: false, syncEngine: syncEngine)
         await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
 
       case .willSendChanges:
-        await MainActor.run {
-          sendingChangesCount += 1
-        }
+        await updateActivity(.sending, isStarting: true, syncEngine: syncEngine)
       case .didSendChanges:
-        await MainActor.run {
-          sendingChangesCount -= 1
-        }
+        await updateActivity(.sending, isStarting: false, syncEngine: syncEngine)
 
       @unknown default:
         break
@@ -2567,6 +2583,7 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   package struct SyncEngines {
+    fileprivate var activityCounts: [ObjectIdentifier: [SyncEngine.Activity: Int]] = [:]
     private let rawValue: (private: any SyncEngineProtocol, shared: any SyncEngineProtocol)?
     init() {
       rawValue = nil
@@ -2924,11 +2941,6 @@
   @DatabaseFunction("sqlitedata_icloud_currentOwnerName")
   func currentOwnerName() -> String? {
     _currentZoneID?.ownerName
-  }
-
-  private struct ActivityCounts {
-    var sendingChangesCount = 0
-    var fetchingChangesCount = 0
   }
 
   #if DEBUG
