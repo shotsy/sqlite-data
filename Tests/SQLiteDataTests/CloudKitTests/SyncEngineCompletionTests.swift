@@ -9,22 +9,27 @@
 
   extension BaseCloudKitTests {
     /// Characterization tests: activity is not a database/delegate completion barrier.
-    /// Every intermediate assertion is made while a SQL or delegate gate is closed, not
-    /// after a sleep or a scheduler yield. Events still go through the real handler.
+    /// SQL/delegate gates establish pending work. A serial-executor yield registers
+    /// settlement waiters; no sleeps are used. Events go through the real handler.
     @MainActor
+    @Suite(.serialized)
     final class SyncEngineCompletionTests: BaseCloudKitTests, @unchecked Sendable {
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func finalApplyIsPendingAfterFetchingFlagClears() async throws {
-        try await prepareRemoteUpdate(pending: true)
+      @Test(arguments: [CKDatabase.Scope.private, .shared])
+      func finalApplyIsPendingAfterFetchingFlagClears(scope: CKDatabase.Scope) async throws {
+        try await prepareRemoteUpdate(pending: true, scope: scope)
+        let engine = syncEngine.syncEngine(for: scope)
+        let previous = try await syncEngine.waitForSettlement()
         let apply = CompletionSQLGate()
         try await installApplyGate(apply)
         defer { apply.open() }
 
-        await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
         #expect(syncEngine.isFetchingChanges)
+        #expect(!syncEngine.isValid(previous))
         let finished = LockIsolated(false)
         let task = Task {
-          await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
           finished.setValue(true)
         }
         await apply.entered.wait()
@@ -33,19 +38,33 @@
         #expect(!syncEngine.isFetchingChanges)
         #expect(!syncEngine.isSynchronizing)
         #expect(!finished.value)
+        #expect(!syncEngine.isValid(previous))
+        let (settlement, settled) = await startSettlementWaiter()
+        #expect(!settled.value)
 
         apply.open()
         await task.value
+        let token = try await settlement.value
+        #expect(syncEngine.isValid(token))
+        #expect(settled.value)
         #expect(finished.value)
         try await expectTitle("Remote")
         try await expectPendingCount(0)
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test($syncEngineDelegate.set(CompletionReportingDelegate()))
-      func terminalRollbackPrecedesReportButReportOutlivesFetchingFlag() async throws {
+      @Test(
+        $syncEngineDelegate.set(CompletionReportingDelegate()),
+        arguments: [CKDatabase.Scope.private, .shared]
+      )
+      func terminalRollbackPrecedesReportButReportOutlivesFetchingFlag(
+        scope: CKDatabase.Scope
+      ) async throws {
         let delegate = try #require(syncEngineDelegate as? CompletionReportingDelegate)
-        try await prepareRemoteUpdate(pending: true)
+        delegate.reset()
+        try await prepareRemoteUpdate(pending: true, scope: scope)
+        let engine = syncEngine.syncEngine(for: scope)
+        let previous = try await syncEngine.waitForSettlement()
         let apply = CompletionSQLGate()
         try await installApplyGate(apply, fail: true)
         let writer = userDatabase.database
@@ -60,16 +79,19 @@
           delegate.release.signal()
         }
 
-        await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
         let finished = LockIsolated(false)
         let task = Task {
-          await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
           finished.setValue(true)
         }
         await apply.entered.wait()
         #expect(!syncEngine.isFetchingChanges)
         #expect(delegate.errors.value.isEmpty)
         #expect(!finished.value)
+        #expect(!syncEngine.isValid(previous))
+        let (settlement, settled) = await startSettlementWaiter()
+        #expect(!settled.value)
 
         apply.open()
         await delegate.entered.wait()
@@ -83,9 +105,14 @@
         #expect(!syncEngine.isFetchingChanges)
         #expect(!finished.value)
         #expect(!delegate.finished.value)
+        #expect(!settled.value)
+        #expect(!syncEngine.isValid(previous))
 
         delegate.release.signal()
         await task.value
+        let token = try await settlement.value
+        #expect(syncEngine.isValid(token))
+        #expect(settled.value)
         #expect(delegate.finished.value)
         try await expectTitle("Local")
         // A terminal application error leaves the retry marker in the current API.
@@ -96,18 +123,24 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test($syncEngineDelegate.set(CompletionReportingDelegate()))
-      func cancellationReportCanSuspendOnWriterQuery() async throws {
+      @Test(
+        $syncEngineDelegate.set(CompletionReportingDelegate()),
+        arguments: [CKDatabase.Scope.private, .shared]
+      )
+      func cancellationReportCanSuspendOnWriterQuery(scope: CKDatabase.Scope) async throws {
         let delegate = try #require(syncEngineDelegate as? CompletionReportingDelegate)
-        try await prepareRemoteUpdate(pending: false)
-        let record = try syncEngine.private.database.record(for: RemindersList.recordID(for: 1))
+        delegate.reset()
+        let record = try await prepareRemoteUpdate(pending: false, scope: scope)
+        let engine = syncEngine.syncEngine(for: scope)
+        let previous = try await syncEngine.waitForSettlement()
         let query = CompletionSQLGate()
         let writer = userDatabase.database
         try await writer.write { db in
-          db.add(function: DatabaseFunction("completion_query_gate", argumentCount: 0) { _ in
-            query.block()
-            return 0
-          })
+          db.add(
+            function: DatabaseFunction("completion_query_gate", argumentCount: 0) { _ in
+              query.block()
+              return 0
+            })
         }
         delegate.query.setValue {
           // Unstructured task intentionally escapes the cancelled event's cancellation.
@@ -130,7 +163,7 @@
           withUnsafeCurrentTask { $0?.cancel() }
           await syncEngine.handleEvent(
             .fetchedRecordZoneChanges(modifications: [record], deletions: []),
-            syncEngine: syncEngine.private
+            syncEngine: engine
           )
           finished.setValue(true)
         }
@@ -142,41 +175,63 @@
         #expect(!syncEngine.isFetchingChanges)
         #expect(!finished.value)
         #expect(!delegate.finished.value)
+        #expect(!syncEngine.isValid(previous))
+        let (settlement, settled) = await startSettlementWaiter()
+        #expect(!settled.value)
 
         query.open()
         await delegate.entered.wait()
         #expect(delegate.queryTitle.value == "Local")
         #expect(delegate.queryFailure.value == nil)
+        #expect(!settled.value)
+        #expect(!syncEngine.isValid(previous))
         delegate.release.signal()
         await task.value
+        let token = try await settlement.value
+        #expect(syncEngine.isValid(token))
+        #expect(settled.value)
         #expect(delegate.finished.value)
+        // Settlement means callbacks completed, not that transient retries succeeded.
         try await expectPendingCount(1)
 
-        await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
+        await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
+        #expect(!syncEngine.isValid(token))
         try await expectTitle("Remote")
         try await expectPendingCount(0)
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func explicitFetchAwaitsApplyButDoesNotEstablishAStableEpoch() async throws {
+      @Test(arguments: [false, true])
+      func explicitFetchAwaitsApplyButDoesNotEstablishAStableEpoch(
+        useSettlementBarrier: Bool
+      ) async throws {
         try await prepareRemoteUpdate(pending: false)
         let explicitApply = CompletionSQLGate()
         try await installApplyGate(explicitApply)
         defer { explicitApply.open() }
         let returned = LockIsolated(false)
         let fetch = Task {
-          try await syncEngine.fetchChanges()
+          let token: SyncEngine.SettledToken?
+          if useSettlementBarrier {
+            token = try await syncEngine.fetchChangesAndWaitForSettlement()
+          } else {
+            try await syncEngine.fetchChanges()
+            token = nil
+          }
           returned.setValue(true)
+          return token
         }
         await explicitApply.entered.wait()
         // Do not mischaracterize fetchChanges: it does await its explicit callbacks.
         #expect(!returned.value)
         explicitApply.open()
-        try await fetch.value
+        let token = try await fetch.value
+        if let token { #expect(syncEngine.isValid(token)) }
         #expect(returned.value)
         try await expectTitle("Remote")
 
-        let laterRecord = try syncEngine.private.database.record(for: RemindersList.recordID(for: 1))
+        let laterRecord = try syncEngine.private.database.record(
+          for: RemindersList.recordID(for: 1))
         laterRecord.setValue("Later automatic fetch", forKey: "title", at: now + 2)
         _ = try syncEngine.modifyRecords(scope: .private, saving: [laterRecord])
         try await userDatabase.write { db in
@@ -199,6 +254,7 @@
         #expect(returned.value)
         #expect(!syncEngine.isFetchingChanges)
         #expect(!automaticFinished.value)
+        if let token { #expect(!syncEngine.isValid(token)) }
         automaticApply.open()
         await automatic.value
         try await expectTitle("Later automatic fetch")
@@ -206,38 +262,157 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      private func prepareRemoteUpdate(pending: Bool) async throws {
-        try await userDatabase.userWrite { db in
-          try db.seed { RemindersList(id: 1, title: "Local") }
+      @Test(
+        $syncEngineDelegate.set(CompletionReportingDelegate()),
+        arguments: [false, true]
+      )
+      func retiredCallbackBlocksRestartedSettlement(explicitFetch: Bool) async throws {
+        let delegate = try #require(syncEngineDelegate as? CompletionReportingDelegate)
+        delegate.reset()
+        try await prepareRemoteUpdate(pending: !explicitFetch)
+        let previous = try await syncEngine.waitForSettlement()
+        let oldEngine = syncEngine.private
+        let apply = CompletionSQLGate()
+        try await installApplyGate(apply, fail: true)
+        defer {
+          apply.open()
+          delegate.release.signal()
         }
-        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
-        let record = try syncEngine.private.database.record(for: RemindersList.recordID(for: 1))
+        if !explicitFetch {
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: oldEngine)
+        }
+        let operationFinished = LockIsolated(false)
+        let operation = Task {
+          defer { operationFinished.setValue(true) }
+          if explicitFetch {
+            _ = try await syncEngine.fetchChangesAndWaitForSettlement()
+          } else {
+            await syncEngine.handleEvent(.didFetchChanges, syncEngine: oldEngine)
+          }
+        }
+        await apply.entered.wait()
+        let (oldWaiter, oldSettled) = await startSettlementWaiter()
+        #expect(!oldSettled.value)
+        #expect(!syncEngine.isValid(previous))
+
+        syncEngine.stop()
+        await #expect(throws: CancellationError.self) { try await oldWaiter.value }
+        #expect(!oldSettled.value)
+        #expect(!operationFinished.value)
+
+        // Restart reads the database synchronously. Release the writer into a still-
+        // blocked error report, preserving the old callback without deadlocking start.
+        apply.open()
+        await delegate.entered.wait()
+        #expect(!delegate.finished.value)
+        try await syncEngine.start()
+        #expect(syncEngine.private !== oldEngine)
+        #expect(!syncEngine.isValid(previous))
+        let (newWaiter, newSettled) = await startSettlementWaiter()
+        #expect(!newSettled.value)
+        #expect(!operationFinished.value)
+
+        delegate.release.signal()
+        if explicitFetch {
+          // The explicit fetch does eventually return, but its lifetime was stopped.
+          await #expect(throws: CancellationError.self) { try await operation.value }
+        } else {
+          try await operation.value
+        }
+        let token = try await newWaiter.value
+        #expect(syncEngine.isValid(token))
+        #expect(newSettled.value)
+        #expect(delegate.finished.value)
+        #expect(operationFinished.value)
+        try await expectTitle("Local")
+        try await userDatabase.write { db in
+          try UnsyncedRecordID.all.delete().execute(db)
+        }
+        try await syncEngine.processPendingDatabaseChanges(scope: .private)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @discardableResult
+      private func prepareRemoteUpdate(
+        pending: Bool,
+        scope: CKDatabase.Scope = .private
+      ) async throws -> CKRecord {
+        let recordID: CKRecord.ID
+        if scope == .shared {
+          let zoneID = CKRecordZone.ID(zoneName: "completion.shared", ownerName: "another.owner")
+          recordID = RemindersList.recordID(for: 1, zoneID: zoneID)
+          try await syncEngine.modifyRecordZones(
+            scope: .shared, saving: [CKRecordZone(zoneID: zoneID)]
+          ).notify()
+          let initial = CKRecord(recordType: RemindersList.tableName, recordID: recordID)
+          initial.setValue(1, forKey: "id", at: now)
+          initial.setValue("Local", forKey: "title", at: now)
+          let share = CKShare(
+            rootRecord: initial,
+            shareID: CKRecord.ID(recordName: "completion.share", zoneID: zoneID)
+          )
+          share.publicPermission = .readWrite
+          let results = try await syncEngine.modifyRecords(
+            scope: .shared, saving: [initial, share]
+          ).notify()
+          for result in results.saveResults.values { _ = try result.get() }
+        } else {
+          recordID = RemindersList.recordID(for: 1)
+          try await userDatabase.userWrite { db in
+            try db.seed { RemindersList(id: 1, title: "Local") }
+          }
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        }
+        let engine = syncEngine.syncEngine(for: scope)
+        let record = try engine.database.record(for: recordID)
         record.setValue("Remote", forKey: "title", at: now + 1)
-        _ = try syncEngine.modifyRecords(scope: .private, saving: [record])
+        _ = try syncEngine.modifyRecords(scope: scope, saving: [record])
         if pending {
           try await userDatabase.write { db in
             try UnsyncedRecordID.insert {
-              UnsyncedRecordID(recordID: RemindersList.recordID(for: 1))
+              UnsyncedRecordID(recordID: recordID)
             }.execute(db)
           }
         }
+        return try engine.database.record(for: recordID)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      private func startSettlementWaiter() async -> (
+        Task<SyncEngine.SettledToken, any Error>, LockIsolated<Bool>
+      ) {
+        let settled = LockIsolated(false)
+        var waiter: Task<SyncEngine.SettledToken, any Error>!
+        await withMainSerialExecutor {
+          waiter = Task {
+            let token = try await syncEngine.waitForSettlement()
+            settled.setValue(true)
+            return token
+          }
+          // Register the waiter while the SQL/delegate gate holds real work pending.
+          await Task.yield()
+          #expect(!settled.value)
+        }
+        return (waiter, settled)
       }
 
       private func installApplyGate(_ gate: CompletionSQLGate, fail: Bool = false) async throws {
         try await userDatabase.database.write { db in
-          db.add(function: DatabaseFunction("completion_apply_gate", argumentCount: 0) { _ in
-            gate.block()
-            return 0
-          })
+          db.add(
+            function: DatabaseFunction("completion_apply_gate", argumentCount: 0) { _ in
+              gate.block()
+              return 0
+            })
           try db.execute(sql: "DROP TRIGGER IF EXISTS completion_apply")
           // AFTER UPDATE makes the terminal case prove rollback, not just a rejected write.
-          try db.execute(sql: """
-            CREATE TRIGGER completion_apply AFTER UPDATE ON remindersLists
-            BEGIN
-              SELECT completion_apply_gate();
-              \(fail ? "SELECT RAISE(ABORT, 'completion test rollback');" : "")
-            END
-            """)
+          try db.execute(
+            sql: """
+              CREATE TRIGGER completion_apply AFTER UPDATE ON remindersLists
+              BEGIN
+                SELECT completion_apply_gate();
+                \(fail ? "SELECT RAISE(ABORT, 'completion test rollback');" : "")
+              END
+              """)
         }
       }
 
@@ -315,9 +490,21 @@
     let query = LockIsolated<(@Sendable () async throws -> String?)?>(nil)
     let queryTitle = LockIsolated<String?>(nil)
     let queryFailure = LockIsolated<String?>(nil)
-    let entered = CompletionLatch()
-    let release = CompletionLatch()
+    private let gates = LockIsolated((entered: CompletionLatch(), release: CompletionLatch()))
+    var entered: CompletionLatch { gates.value.entered }
+    var release: CompletionLatch { gates.value.release }
     let finished = LockIsolated(false)
+
+    /// The task-local trait shares its value across parameter cases. Cases are serialized
+    /// and await their handler before returning, so each can start with fresh gates/state.
+    func reset() {
+      errors.setValue([])
+      query.setValue(nil)
+      queryTitle.setValue(nil)
+      queryFailure.setValue(nil)
+      gates.setValue((entered: CompletionLatch(), release: CompletionLatch()))
+      finished.setValue(false)
+    }
 
     func syncEngine(
       _ syncEngine: SQLiteData.SyncEngine,
