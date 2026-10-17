@@ -123,6 +123,58 @@
     }
   }
 
+  /// App-owned identity captured synchronously before a transfer starts. Rotate the window on
+  /// stop/restart and the account token on identity changes; never bind an old token to a new account.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public struct SyncEngineTransferContext: Sendable, Equatable {
+    public let accountToken: UUID
+    public let windowToken: UUID
+
+    public init(accountToken: UUID, windowToken: UUID) {
+      self.accountToken = accountToken
+      self.windowToken = windowToken
+    }
+  }
+
+  /// Historical server-version evidence, not an inventory or proof of current local-row equality.
+  /// Identity includes the container, database scope and full record ID (including zone owner).
+  /// Change tags are opaque: never compare them across records/accounts or substitute SQL counts
+  /// or modification times. Retained coverage requires the app's complete exact-version inventory.
+  /// These identifiers are for local validation, not analytics; no record payload is exposed.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public struct SyncEngineRecordVersion: Sendable, Equatable {
+    public let recordID: CKRecord.ID
+    public let recordType: CKRecord.RecordType
+    public let changeTag: String
+    public let userModificationTime: Int64
+
+    init?(_ record: CKRecord) {
+      guard let tag = record.recordChangeTag, record.userModificationTime >= 0 else { return nil }
+      recordID = record.recordID
+      recordType = record.recordType
+      changeTag = tag
+      userModificationTime = record.userModificationTime
+    }
+  }
+
+  /// Final diagnostic result for one originating engine transfer, delivered before its idle edge.
+  /// Only acknowledged saves and exactly applied, committed fetches appear in `records` (including
+  /// partial evidence on failure). Prepared, deleted, skipped, merged and deferred rows do not.
+  /// Empty completed fetches may advance download time, never account confirmation. No result
+  /// proves complete retained-version coverage by itself. Missing origin/boundaries or overlapping
+  /// same-engine work is unconfirmed; callers must reject stale app-owned contexts independently.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  public struct SyncEngineTransferOutcome: Sendable {
+    public enum Direction: Sendable { case upload, download }
+    public enum Result: Sendable { case completed, failed, interrupted, unconfirmed }
+    public let context: SyncEngineTransferContext?
+    public let containerIdentifier: String?
+    public let databaseScope: CKDatabase.Scope
+    public let direction: Direction
+    public let result: Result
+    public let records: [SyncEngineRecordVersion]
+  }
+
   /// An interface for observing ``SyncEngine`` events and customizing ``SyncEngine`` behavior.
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   public protocol SyncEngineDelegate: AnyObject, Sendable {
@@ -221,6 +273,16 @@
       context: SyncEngineErrorContext
     ) async
 
+    /// Capture app identity without suspension. Return nil when identity/coverage is unavailable.
+    /// Called before async transfer work; implementations must not call back into this engine.
+    func syncEngine(
+      _ syncEngine: SyncEngine, transferContextFor databaseScope: CKDatabase.Scope
+    ) -> SyncEngineTransferContext?
+
+    /// Observes immutable transfer evidence. Default is a no-op; never infer success from idle.
+    func syncEngine(_ syncEngine: SyncEngine, didFinishTransfer outcome: SyncEngineTransferOutcome)
+      async
+
     /// Called before a remote zone deletion or purge is mirrored into a broad local delete.
     func syncEngine(
       _ syncEngine: SyncEngine,
@@ -250,6 +312,14 @@
       _ syncEngine: SyncEngine,
       didReportError error: any Error,
       context: SyncEngineErrorContext
+    ) async {}
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine, transferContextFor databaseScope: CKDatabase.Scope
+    ) -> SyncEngineTransferContext? { nil }
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine, didFinishTransfer outcome: SyncEngineTransferOutcome
     ) async {}
 
     public func syncEngine(
