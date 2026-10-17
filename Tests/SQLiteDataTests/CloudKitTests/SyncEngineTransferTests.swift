@@ -689,10 +689,10 @@
     }
 
     func signal() {
-      let waiters = state.withValue {
-        $0.signaled = true
-        defer { $0.waiters.removeAll() }
-        return $0.waiters
+      let waiters = state.withValue { value in
+        value.signaled = true
+        defer { value.waiters.removeAll() }
+        return value.waiters
       }
       for waiter in waiters { waiter.resume() }
     }

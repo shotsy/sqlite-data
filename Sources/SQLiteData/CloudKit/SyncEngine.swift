@@ -187,10 +187,10 @@
       }
 
       func finish() {
-        let waiters = completion.withValue {
-          $0.finished = true
-          defer { $0.waiters.removeAll() }
-          return $0.waiters
+        let waiters = completion.withValue { value in
+          value.finished = true
+          defer { value.waiters.removeAll() }
+          return value.waiters
         }
         for waiter in waiters { waiter.resume() }
       }
