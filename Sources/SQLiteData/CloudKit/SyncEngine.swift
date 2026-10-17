@@ -49,6 +49,117 @@
     // Entries live until the explicit fetch returns, not until the activity flag becomes idle.
     private let fetchErrorReports = LockIsolated<[UUID: FetchErrorAttempt]>([:])
 
+    private struct TransferKey: Hashable {
+      let engine: ObjectIdentifier
+      let upload: Bool
+    }
+    private struct TransferState {
+      var result = SyncEngineTransferOutcome.Result.completed
+      var records: [SyncEngineRecordVersion] = []
+      var deferred: Set<CKRecord.ID> = []
+      var active = 0
+      var starts = 0
+      var explicitStarts = 0
+    }
+    private final class Transfer: Sendable {
+      let context: SyncEngineTransferContext?
+      let explicit: Bool
+      let state = LockIsolated(TransferState())
+      init(context: SyncEngineTransferContext?, explicit: Bool) {
+        self.context = context
+        self.explicit = explicit
+      }
+      func mark(_ result: SyncEngineTransferOutcome.Result) {
+        state.withValue {
+          if $0.result == .interrupted { return }
+          if result == .interrupted || result == .unconfirmed || $0.result == .completed {
+            $0.result = result
+          }
+        }
+      }
+    }
+    private let transfers = LockIsolated<[TransferKey: Transfer]>([:])
+    @TaskLocal private static var eventTransfer: Transfer?
+    @TaskLocal private static var isTransferEvent = false
+
+    private func transfer(_ engine: any SyncEngineProtocol, upload: Bool = false) -> Transfer? {
+      if Self.isTransferEvent { return Self.eventTransfer }
+      return transfers.withValue {
+        $0[TransferKey(engine: ObjectIdentifier(engine), upload: upload)]
+      }
+    }
+
+    @discardableResult
+    private func beginTransfer(
+      _ engine: any SyncEngineProtocol, upload: Bool = false, explicit: Bool = false
+    ) -> Transfer {
+      let context = delegate?.syncEngine(self, transferContextFor: engine.database.databaseScope)
+      let current = syncEngines.withValue { $0.private === engine || $0.shared === engine }
+      return transfers.withValue {
+        let key = TransferKey(engine: ObjectIdentifier(engine), upload: upload)
+        if let existing = $0[key] {
+          existing.state.withValue {
+            if explicit || !existing.explicit || $0.starts > 0, $0.result != .interrupted {
+              $0.result = .unconfirmed
+            }
+            if explicit { $0.explicitStarts += 1 } else { $0.starts += 1 }
+          }
+          return existing
+        }
+        let window = Transfer(context: context, explicit: explicit)
+        window.state.withValue {
+          if explicit { $0.explicitStarts = 1 } else { $0.starts = 1 }
+        }
+        if context == nil || container.containerIdentifier == nil { window.mark(.unconfirmed) }
+        if !current { window.mark(.interrupted) }
+        $0[key] = window
+        return window
+      }
+    }
+
+    private func finishTransfer(
+      _ engine: any SyncEngineProtocol, upload: Bool = false, explicit: Bool = false
+    ) async {
+      let completion = transfers.withValue {
+        let key = TransferKey(engine: ObjectIdentifier(engine), upload: upload)
+        guard let window = $0[key] else { return nil as (Transfer, TransferState)? }
+        let finished = window.state.withValue {
+          if explicit {
+            $0.explicitStarts = max(0, $0.explicitStarts - 1)
+            if $0.explicitStarts == 0 && $0.starts > 0 {
+              if $0.result == .completed { $0.result = .unconfirmed }
+              $0.starts = 0
+            }
+          } else {
+            $0.starts = max(0, $0.starts - 1)
+          }
+          return $0.explicitStarts == 0 && $0.starts == 0
+        }
+        guard finished else { return nil }
+        $0[key] = nil
+        let snapshot = window.state.withValue { $0 }
+        return (window, snapshot)
+      }
+      guard let (window, snapshot) = completion else { return }
+      if snapshot.active > 0 { window.mark(.unconfirmed) }
+      let current = syncEngines.withValue { $0.private === engine || $0.shared === engine }
+      if !current || Task.isCancelled { window.mark(.interrupted) }
+      if window.state.withValue({ !$0.deferred.isEmpty || (upload && $0.records.isEmpty) }) {
+        if window.state.result == .completed { window.mark(.unconfirmed) }
+      }
+      let state = window.state.withValue { $0 }
+      let result = state.result
+      await delegate?.syncEngine(
+        self,
+        didFinishTransfer: SyncEngineTransferOutcome(
+          context: window.context, containerIdentifier: container.containerIdentifier,
+          databaseScope: engine.database.databaseScope, direction: upload ? .upload : .download,
+          result: result,
+          records: result == .completed || result == .failed ? state.records : []
+        )
+      )
+    }
+
     private struct FetchErrorAttempt {
       let engineID: ObjectIdentifier
       var reports: [FetchErrorReport] = []
@@ -484,6 +595,7 @@
           observationRegistrar.withMutation(of: self, keyPath: \.isFetchingChanges) {
             syncEngines.withValue {
               settlement.stop()
+              transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
               $0 = SyncEngines()
             }
           }
@@ -641,16 +753,33 @@
       }
       guard let privateSyncEngine, let sharedSyncEngine
       else { return }
-      async let `private`: Void = fetchChanges(options, syncEngine: privateSyncEngine)
-      async let shared: Void = fetchChanges(options, syncEngine: sharedSyncEngine)
-      _ = try await (`private`, shared)
-      await handleFetchedRecordZoneChanges(syncEngine: privateSyncEngine)
-      await handleFetchedRecordZoneChanges(syncEngine: sharedSyncEngine)
+      let privateWindow = beginTransfer(privateSyncEngine, explicit: true)
+      let sharedWindow = beginTransfer(sharedSyncEngine, explicit: true)
+      do {
+        async let `private`: Void = fetchChanges(
+          options, syncEngine: privateSyncEngine, window: privateWindow)
+        async let shared: Void = fetchChanges(
+          options, syncEngine: sharedSyncEngine, window: sharedWindow)
+        _ = try await (`private`, shared)
+        await handleFetchedRecordZoneChanges(syncEngine: privateSyncEngine)
+        await handleFetchedRecordZoneChanges(syncEngine: sharedSyncEngine)
+      } catch {
+        for (engine, window) in [
+          (privateSyncEngine, privateWindow), (sharedSyncEngine, sharedWindow),
+        ] {
+          if window.state.result == .completed { window.mark(.interrupted) }
+          await finishTransfer(engine, explicit: true)
+        }
+        throw error
+      }
+      await finishTransfer(privateSyncEngine, explicit: true)
+      await finishTransfer(sharedSyncEngine, explicit: true)
     }
 
     private func fetchChanges(
       _ options: CKSyncEngine.FetchChangesOptions,
-      syncEngine: any SyncEngineProtocol
+      syncEngine: any SyncEngineProtocol,
+      window: Transfer
     ) async throws {
       let attemptID = UUID()
       fetchErrorReports.withValue {
@@ -660,6 +789,7 @@
       do {
         try await syncEngine.fetchChanges(options)
       } catch {
+        window.mark(error is CancellationError ? .interrupted : .failed)
         // Only suppress an equal event error observed during this call on this engine.
         // Do not collapse by CKError.Code: that would hide unrelated zone/partial failures.
         let reports = fetchErrorReports.withValue { $0[attemptID]?.reports ?? [] }
@@ -725,8 +855,20 @@
       }
       guard let privateSyncEngine, let sharedSyncEngine
       else { return }
-      async let `private`: Void = privateSyncEngine.sendChanges(options)
-      async let shared: Void = sharedSyncEngine.sendChanges(options)
+      let privateWindow = beginTransfer(privateSyncEngine, upload: true, explicit: true)
+      let sharedWindow = beginTransfer(sharedSyncEngine, upload: true, explicit: true)
+      @Sendable func send(_ engine: any SyncEngineProtocol, window: Transfer) async throws {
+        do {
+          try await engine.sendChanges(options)
+          await finishTransfer(engine, upload: true, explicit: true)
+        } catch {
+          window.mark(error is CancellationError ? .interrupted : .failed)
+          await finishTransfer(engine, upload: true, explicit: true)
+          throw error
+        }
+      }
+      async let `private`: Void = send(privateSyncEngine, window: privateWindow)
+      async let shared: Void = send(sharedSyncEngine, window: sharedWindow)
       _ = try await (`private`, shared)
     }
 
@@ -1169,6 +1311,30 @@
         )
       }
       defer { settlement.endEvent(event, engine: syncEngine) }
+      // A racing final boundary cannot certify work still applying or reporting an error.
+      let activeTransfer = transfers.withValue { windows -> Transfer? in
+        let upload: Bool
+        switch event {
+        case .fetchedDatabaseChanges, .fetchedRecordZoneChanges, .didFetchRecordZoneChanges:
+          upload = false
+        case .sentRecordZoneChanges:
+          upload = true
+        default:
+          return nil
+        }
+        let window = windows[TransferKey(engine: ObjectIdentifier(syncEngine), upload: upload)]
+        window?.state.withValue { $0.active += 1 }
+        return window
+      }
+      defer { activeTransfer?.state.withValue { $0.active -= 1 } }
+      await Self.$isTransferEvent.withValue(true) {
+        await Self.$eventTransfer.withValue(activeTransfer) {
+          await handleTransferEvent(event, syncEngine: syncEngine)
+        }
+      }
+    }
+
+    private func handleTransferEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
       #if DEBUG
         logger.log(event, syncEngine: syncEngine)
       #endif
@@ -1179,6 +1345,7 @@
       case .stateUpdate(let stateSerialization):
         await handleStateUpdate(stateSerialization: stateSerialization, syncEngine: syncEngine)
       case .fetchedDatabaseChanges(let modifications, let deletions):
+        if !deletions.isEmpty { transfer(syncEngine)?.mark(.unconfirmed) }
         await handleFetchedDatabaseChanges(
           modifications: modifications,
           deletions: deletions,
@@ -1210,19 +1377,26 @@
         await updateActivity(.fetchingZone(zoneID), isStarting: true, syncEngine: syncEngine)
       case .didFetchRecordZoneChanges(let zoneID, let error):
         if let error {
+          transfer(syncEngine)?.mark(.failed)
           await reportFetchError(error, zoneID: zoneID, syncEngine: syncEngine)
         }
         await updateActivity(.fetchingZone(zoneID), isStarting: false, syncEngine: syncEngine)
 
       case .willFetchChanges:
+        beginTransfer(syncEngine)
         await updateActivity(.fetching, isStarting: true, syncEngine: syncEngine)
       case .didFetchChanges:
+        await Self.$isTransferEvent.withValue(false) {
+          await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
+        }
+        await finishTransfer(syncEngine)
         await updateActivity(.fetching, isStarting: false, syncEngine: syncEngine)
-        await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
 
       case .willSendChanges:
+        beginTransfer(syncEngine, upload: true)
         await updateActivity(.sending, isStarting: true, syncEngine: syncEngine)
       case .didSendChanges:
+        await finishTransfer(syncEngine, upload: true)
         await updateActivity(.sending, isStarting: false, syncEngine: syncEngine)
 
       @unknown default:
@@ -1528,6 +1702,7 @@
       guard syncEngine === syncEngines.private
       else { return }
 
+      transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
       switch changeType {
       case .signIn:
         syncEngine.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
@@ -1690,8 +1865,31 @@
     ) async {
       settlement.begin()
       defer { settlement.end() }
-      let protectedRecordIDs: (Set<CKRecord.ID>, Set<CKRecord.ID>) =
+      let window = transfer(syncEngine)
+      window?.state.withValue { $0.active += 1 }
+      defer { window?.state.withValue { $0.active -= 1 } }
+      @Sendable func report(_ error: any Error) async {
+        guard let window else { return }
+        window.mark(error is CancellationError ? .interrupted : .failed)
+        await delegate?.syncEngine(
+          self, didReportError: error,
+          context: SyncEngineErrorContext(
+            operation: .fetchedRecordApplication, databaseScope: syncEngine.database.databaseScope
+          )
+        )
+      }
+      @Sendable func applying<T: Sendable>(
+        _ body: @Sendable () async throws -> T
+      ) async -> T? {
         await withErrorReporting(.sqliteDataCloudKitFailure) {
+          do { return try await body() } catch {
+            await report(error)
+            throw error
+          }
+        }
+      }
+      let protectedRecordIDs: (Set<CKRecord.ID>, Set<CKRecord.ID>) =
+        await applying {
           try await metadatabase.read { db in
             let terminalDeleteIDs = try DurableRecordZoneFailure
               .findAll(modifications.map(\.recordID), action: DurableRecordZoneFailure.deleteAction)
@@ -1707,6 +1905,9 @@
           }
         }
         ?? (Set(), Set())
+      if !protectedRecordIDs.0.isEmpty || !protectedRecordIDs.1.isEmpty {
+        window?.mark(.unconfirmed)
+      }
       let applicableModifications = modifications.filter {
         !protectedRecordIDs.0.contains($0.recordID)
       }
@@ -1746,6 +1947,7 @@
                     .execute(db)
                 }
               } catch {
+                window?.mark(error is CancellationError ? .interrupted : .failed)
                 await delegate?.syncEngine(
                   self,
                   didReportError: error,
@@ -1764,13 +1966,13 @@
           await open(table)
         } else if recordType == CKRecord.SystemType.share {
           for shareRecordID in recordIDs {
-            await withErrorReporting(.sqliteDataCloudKitFailure) {
+            await applying {
               try await deleteShare(shareRecordID: shareRecordID)
             }
           }
         } else {
           // NB: Deleting a record from a table we do not currently recognize.
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
+          await applying {
             try await userDatabase.write { db in
               try SyncMetadata
                 .findAll(recordIDs)
@@ -1782,7 +1984,7 @@
       }
 
       let unsyncedRecords =
-        await withErrorReporting(.sqliteDataCloudKitFailure) {
+        await applying {
           var unsyncedRecordIDs = try await userDatabase.write { db in
             Set(
               try UnsyncedRecordID.all
@@ -1820,6 +2022,7 @@
               .dropFirst(start)
               .prefix(batchSize)
             let results = try await syncEngine.database.records(for: Array(recordIDsBatch))
+            if results.count != recordIDsBatch.count { window?.mark(.unconfirmed) }
             for (recordID, result) in results {
               switch result {
               case .success(let record):
@@ -1828,7 +2031,8 @@
                 try await userDatabase.write { db in
                   try UnsyncedRecordID.find(recordID).delete().execute(db)
                 }
-              case .failure:
+              case .failure(let error):
+                await report(error)
                 continue
               }
             }
@@ -1855,10 +2059,23 @@
           shares.append(.share(share))
         } else {
           do {
-            try await userDatabase.write { db in
+            let version = SyncEngineRecordVersion(record)
+            let application = try await userDatabase.write { db in
               try upsertFromServerRecord(record, db: db)
             }
+            switch application {
+            case .applied where version != nil:
+              window?.state.withValue {
+                $0.records.append(version!)
+                $0.deferred.remove(record.recordID)
+              }
+            case .deferred:
+              _ = window?.state.withValue { $0.deferred.insert(record.recordID) }
+            default:
+              window?.mark(.unconfirmed)
+            }
           } catch let error as CancellationError {
+            window?.mark(.interrupted)
             let recordIDs =
               shares.map {
                 switch $0 {
@@ -1893,6 +2110,7 @@
             )
             return
           } catch {
+            window?.mark(.failed)
             await delegate?.syncEngine(
               self,
               didReportError: error,
@@ -1916,18 +2134,19 @@
           group.addTask {
             switch share {
             case .share(let share):
-              await withErrorReporting(.sqliteDataCloudKitFailure) {
+              await applying {
                 try await self.cacheShare(share)
                 try await self.userDatabase.write { db in
                   try UnsyncedRecordID.find(share.recordID).delete().execute(db)
                 }
               }
             case .reference(let shareReference):
-              guard
-                let record = try? await syncEngine.database.record(for: shareReference.recordID),
-                let share = record as? CKShare
-              else { return }
-              await withErrorReporting(.sqliteDataCloudKitFailure) {
+              await applying {
+                let record = try await syncEngine.database.record(for: shareReference.recordID)
+                guard let share = record as? CKShare else {
+                  window?.mark(.unconfirmed)
+                  return
+                }
                 try await self.cacheShare(share)
               }
             }
@@ -2069,6 +2288,16 @@
       failedRecordDeletes: [CKRecord.ID: CKError] = [:],
       syncEngine: any SyncEngineProtocol
     ) async {
+      let window = transfer(syncEngine, upload: true)
+      window?.state.withValue {
+        $0.active += 1
+        $0.records += savedRecords.compactMap(SyncEngineRecordVersion.init)
+      }
+      defer { window?.state.withValue { $0.active -= 1 } }
+      if !failedRecordSaves.isEmpty || !failedRecordDeletes.isEmpty { window?.mark(.failed) }
+      if savedRecords.contains(where: { SyncEngineRecordVersion($0) == nil }) {
+        window?.mark(.unconfirmed)
+      }
       for savedRecord in savedRecords {
         await refreshLastKnownServerRecord(savedRecord)
       }
@@ -2484,21 +2713,24 @@
       _ serverRecord: CKRecord,
       force: Bool = false
     ) async throws {
-      try await userDatabase.write { db in
+      _ = try await userDatabase.write { db in
         try upsertFromServerRecord(serverRecord, force: force, db: db)
       }
     }
 
+    private enum RecordApplication { case applied, deferred, unconfirmed }
+
+    @discardableResult
     private func upsertFromServerRecord(
       _ serverRecord: CKRecord,
       force: Bool = false,
       db: Database
-    ) throws {
+    ) throws -> RecordApplication {
       guard
         let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey,
         serverRecord.encryptedValues[CKRecord.userModificationTimeKey] != nil
       else {
-        return
+        return .unconfirmed
       }
 
       try SyncMetadata.insert {
@@ -2530,12 +2762,12 @@
         let metadata = try SyncMetadata.find(serverRecord.recordID).fetchOne(db),
         let table = tablesByName[serverRecord.recordType]
       else {
-        return
+        return .unconfirmed
       }
 
       serverRecord.userModificationTime = metadata.userModificationTime
 
-      func open<T>(_ table: some SynchronizableTable<T>) throws {
+      func open<T>(_ table: some SynchronizableTable<T>) throws -> RecordApplication {
         var columnNames: [String] = T.TableColumns.writableColumns.map(\.name)
         if !force,
           let allFields = metadata._lastKnownServerRecordAllFields,
@@ -2560,6 +2792,21 @@
             .find(serverRecord.recordID)
             .update { $0.setLastKnownServerRecord(serverRecord) }
             .execute(db)
+          guard columnNames.count == T.TableColumns.writableColumns.count,
+            columnNames.allSatisfy({
+              serverRecord.hasSet(key: $0) && !(serverRecord[$0] is CKAsset)
+            })
+          else { return .unconfirmed }
+          // Verify the committed row, including any application-defined SQL triggers. Assets
+          // are excluded because their read failures can be substituted with NULL by the upsert.
+          let matches = columnNames.map {
+            "\(quote: $0) COLLATE BINARY IS \(serverRecord.encryptedValues[$0]?.queryFragment ?? "NULL")"
+              as QueryFragment
+          }.joined(separator: " AND ")
+          let count = try? #sql(
+            "SELECT count(*) FROM \(T.self) WHERE \(matches)", as: Int.self
+          ).fetchOne(db)
+          return count == 1 ? .applied : .unconfirmed
         } catch {
           guard
             let error = error as? DatabaseError,
@@ -2573,9 +2820,10 @@
           } onConflictDoUpdate: { _ in
           }
           .execute(db)
+          return .deferred
         }
       }
-      try open(table)
+      return try open(table)
     }
 
     private func refreshLastKnownServerRecord(_ record: CKRecord) async {

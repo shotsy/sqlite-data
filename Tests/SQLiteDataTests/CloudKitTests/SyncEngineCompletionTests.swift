@@ -16,7 +16,7 @@
     final class SyncEngineCompletionTests: BaseCloudKitTests, @unchecked Sendable {
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test(arguments: [CKDatabase.Scope.private, .shared])
-      func finalApplyIsPendingAfterFetchingFlagClears(scope: CKDatabase.Scope) async throws {
+      func finalApplyKeepsFetchingActiveUntilCommit(scope: CKDatabase.Scope) async throws {
         try await prepareRemoteUpdate(pending: true, scope: scope)
         let engine = syncEngine.syncEngine(for: scope)
         let previous = try await syncEngine.waitForSettlement()
@@ -34,9 +34,9 @@
         }
         await apply.entered.wait()
 
-        // The final retry is inside its transaction, but the public activity flag is idle.
-        #expect(!syncEngine.isFetchingChanges)
-        #expect(!syncEngine.isSynchronizing)
+        // The final retry now owns the activity edge until application and reporting finish.
+        #expect(syncEngine.isFetchingChanges)
+        #expect(syncEngine.isSynchronizing)
         #expect(!finished.value)
         #expect(!syncEngine.isValid(previous))
         let (settlement, settled) = await startSettlementWaiter()
@@ -57,7 +57,7 @@
         $syncEngineDelegate.set(CompletionReportingDelegate()),
         arguments: [CKDatabase.Scope.private, .shared]
       )
-      func terminalRollbackPrecedesReportButReportOutlivesFetchingFlag(
+      func terminalRollbackPrecedesReportAndFetchingWaitsForReport(
         scope: CKDatabase.Scope
       ) async throws {
         let delegate = try #require(syncEngineDelegate as? CompletionReportingDelegate)
@@ -86,7 +86,7 @@
           finished.setValue(true)
         }
         await apply.entered.wait()
-        #expect(!syncEngine.isFetchingChanges)
+        #expect(syncEngine.isFetchingChanges)
         #expect(delegate.errors.value.isEmpty)
         #expect(!finished.value)
         #expect(!syncEngine.isValid(previous))
@@ -102,7 +102,7 @@
         #expect(delegate.errors.value.first?.context.disposition == .terminalDroppedOrReconciled)
         let errorDescription = delegate.errors.value.first.map { String(describing: $0.error) }
         #expect(errorDescription?.contains("completion test rollback") == true)
-        #expect(!syncEngine.isFetchingChanges)
+        #expect(syncEngine.isFetchingChanges)
         #expect(!finished.value)
         #expect(!delegate.finished.value)
         #expect(!settled.value)
@@ -249,10 +249,10 @@
           automaticFinished.setValue(true)
         }
         await automaticApply.entered.wait()
-        // A completed explicit fetch plus an idle flag is not a stable completion epoch:
-        // a later automatic fetch can already have an uncommitted final apply in flight.
+        // A completed explicit fetch is not a stable completion epoch: a later automatic
+        // fetch can already have an uncommitted final apply in flight.
         #expect(returned.value)
-        #expect(!syncEngine.isFetchingChanges)
+        #expect(syncEngine.isFetchingChanges)
         #expect(!automaticFinished.value)
         if let token { #expect(!syncEngine.isValid(token)) }
         automaticApply.open()
