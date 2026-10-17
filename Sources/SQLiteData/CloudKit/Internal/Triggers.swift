@@ -168,7 +168,7 @@
         SET "_isDeleted" = 1,
           "_deletionOrigin" = CASE
             WHEN \(SyncEngine.$isSynchronizing) THEN NULL
-            WHEN \(raw: SQLiteDataMaintenance.isActiveSQL) THEN 'maintenance'
+            WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
             ELSE 'user' END
         WHERE "recordPrimaryKey" = \(old.primaryKey)
           AND "recordType" = \(quote: T.tableName, delimiter: .text)

@@ -65,6 +65,19 @@ struct MaintenanceTests {
     }
   }
 
+  @Test func lazyScopeDoesNotChangePersistentSchema() throws {
+    let database = try DatabaseQueue()
+    try database.writeWithoutTransaction { db in
+      try SQLiteDataMaintenance.withScope(in: db) {
+        #expect(try isActive(db))
+        try SQLiteDataMaintenance.withScope(in: db) { () throws in
+          #expect(try isActive(db))
+        }
+      }
+      #expect(try !db.tableExists("sqlitedata_maintenanceContext"))
+    }
+  }
+
   @Test func permanentTriggerWithoutSyncEngineAndReopen() throws {
     let path = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
     defer { try? FileManager.default.removeItem(atPath: path) }

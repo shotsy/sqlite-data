@@ -365,7 +365,7 @@
       db.add(function: $currentZoneName)
       db.add(function: $currentOwnerName)
 
-      try SQLiteDataMaintenance.install(in: db)
+      SQLiteDataMaintenance.registerPredicate(in: db)
       for trigger in SyncMetadata.callbackTriggers(for: self) {
         try trigger.execute(db)
       }
@@ -1300,7 +1300,7 @@
       options: CKSyncEngine.SendChangesOptions,
       syncEngine: any SyncEngineProtocol
     ) async -> [CKSyncEngine.PendingRecordZoneChange] {
-      var changes = syncEngine.state.pendingRecordZoneChanges.filter(options.scope.contains)
+      let changes = syncEngine.state.pendingRecordZoneChanges.filter(options.scope.contains)
       guard !changes.isEmpty
       else { return [] }
 
@@ -1310,46 +1310,43 @@
         if case .deleteRecord(let id) = $0 { return id }
         return nil
       }
-      if !candidateDeletes.isEmpty {
-        let revivedRecordIDs = await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await metadatabase.read { db in
-            try SyncMetadata.findAll(candidateDeletes)
-              .where { !$0._isDeleted }
-              .fetchAll(db)
-              .map {
-                CKRecord.ID(
-                  recordName: $0.recordName,
-                  zoneID: CKRecordZone.ID(zoneName: $0.zoneName, ownerName: $0.ownerName)
-                )
+      guard !candidateDeletes.isEmpty else { return changes }
+      let isSharedDatabase = syncEngine.database.databaseScope == .shared
+      guard
+        let decision = await withErrorReporting(
+          .sqliteDataCloudKitFailure,
+          catching: {
+            try await userDatabase.write { db in
+              var changes = changes
+              var cancelled: [CKSyncEngine.PendingRecordZoneChange] = []
+              let liveMetadata = try SyncMetadata.findAll(candidateDeletes)
+                .where { !$0._isDeleted }
+                .fetchAll(db)
+              for metadata in liveMetadata {
+                cancelled.append(
+                  .deleteRecord(
+                    CKRecord.ID(
+                      recordName: metadata.recordName,
+                      zoneID: CKRecordZone.ID(
+                        zoneName: metadata.zoneName, ownerName: metadata.ownerName)
+                    )))
+                if let share = metadata.share { cancelled.append(.deleteRecord(share.recordID)) }
               }
-          }
-        } ?? []
-        let supersededDeletes = revivedRecordIDs.map {
-          CKSyncEngine.PendingRecordZoneChange.deleteRecord($0)
-        }
-        syncEngine.state.remove(pendingRecordZoneChanges: supersededDeletes)
-        changes.removeAll { supersededDeletes.contains($0) }
-      }
+              // A stopped engine can persist the root and share callbacks in separate writes.
+              // Also protect a live root's share when only its share delete is in this batch.
+              let liveShares = try SyncMetadata.where { !$0._isDeleted && $0.isShared }
+                .select(\.share).fetchAll(db).compactMap { $0 }
+              for share in liveShares where candidateDeletes.contains(share.recordID) {
+                cancelled.append(.deleteRecord(share.recordID))
+              }
+              changes.removeAll { cancelled.contains($0) }
 
-      let deletedRecordIDs: [CKRecord.ID] = changes.compactMap {
-        switch $0 {
-        case .saveRecord(_):
-          return nil
-        case .deleteRecord(let recordID):
-          return recordID
-        @unknown default:
-          return nil
-        }
-      }
+              let deletedRecordIDs: [CKRecord.ID] = changes.compactMap {
+                if case .deleteRecord(let id) = $0 { return id }
+                return nil
+              }
 
-      if syncEngine.database.databaseScope == .shared {
-        let (sharesToDelete, recordsWithRoot):
-          ([CKShare?], [(lastKnownServerRecord: CKRecord?, rootLastKnownServerRecord: CKRecord?)]) =
-            await withErrorReporting(.sqliteDataCloudKitFailure) {
-              guard !deletedRecordIDs.isEmpty
-              else { return ([], []) }
-
-              return try await metadatabase.read { db in
+              if isSharedDatabase && !deletedRecordIDs.isEmpty {
                 let sharesToDelete =
                   try SyncMetadata
                   .findAll(deletedRecordIDs)
@@ -1391,41 +1388,31 @@
                   }
                   .fetchAll(db)
 
-                return (sharesToDelete, recordsWithRoot)
+                let shareRecordIDsToDelete = sharesToDelete.compactMap(\.?.recordID)
+                for recordWithRoot in recordsWithRoot {
+                  guard
+                    let lastKnownServerRecord = recordWithRoot.0,
+                    let rootLastKnownServerRecord = recordWithRoot.1
+                  else { continue }
+                  guard let rootShareRecordID = rootLastKnownServerRecord.share?.recordID
+                  else { continue }
+                  guard shareRecordIDsToDelete.contains(rootShareRecordID)
+                  else { continue }
+                  changes.removeAll(where: { $0 == .deleteRecord(lastKnownServerRecord.recordID) })
+                  cancelled.append(.deleteRecord(lastKnownServerRecord.recordID))
+                }
               }
+
+              if !deletedRecordIDs.isEmpty {
+                try SyncMetadata.findAll(deletedRecordIDs).delete().execute(db)
+              }
+              return (changes, cancelled)
             }
-            ?? ([], [])
-
-        let shareRecordIDsToDelete = sharesToDelete.compactMap(\.?.recordID)
-
-        for recordWithRoot in recordsWithRoot {
-          guard
-            let lastKnownServerRecord = recordWithRoot.lastKnownServerRecord,
-            let rootLastKnownServerRecord = recordWithRoot.rootLastKnownServerRecord
-          else { continue }
-          guard let rootShareRecordID = rootLastKnownServerRecord.share?.recordID
-          else { continue }
-          guard shareRecordIDsToDelete.contains(rootShareRecordID)
-          else { continue }
-          changes.removeAll(where: { $0 == .deleteRecord(lastKnownServerRecord.recordID) })
-          syncEngine.state.remove(
-            pendingRecordZoneChanges: [.deleteRecord(lastKnownServerRecord.recordID)]
-          )
-        }
-      }
-
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard !deletedRecordIDs.isEmpty
-        else { return }
-        try await userDatabase.write { db in
-          try SyncMetadata
-            .findAll(deletedRecordIDs)
-            .delete()
-            .execute(db)
-        }
-      }
-
-      return changes
+          })
+      else { return [] }
+      // Do not mutate the in-memory queue until the writer transaction commits successfully.
+      syncEngine.state.remove(pendingRecordZoneChanges: decision.1)
+      return decision.0
     }
 
     package func handleAccountChange(

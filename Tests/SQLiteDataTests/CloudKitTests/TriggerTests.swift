@@ -46,7 +46,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'childWithOnDeleteSetDefaults';
@@ -80,7 +80,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'childWithOnDeleteSetNulls';
@@ -114,7 +114,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'modelAs';
@@ -148,7 +148,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'modelBs';
@@ -182,7 +182,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'modelCs';
@@ -216,7 +216,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'parents';
@@ -250,7 +250,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'reminderTags';
@@ -284,7 +284,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."remindersListID"
                   AND "recordType" = 'remindersListAssets';
@@ -318,7 +318,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."remindersListID"
                   AND "recordType" = 'remindersListPrivates';
@@ -352,7 +352,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'remindersLists';
@@ -386,7 +386,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'reminders';
@@ -420,7 +420,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'scopedModels';
@@ -474,7 +474,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."title"
                   AND "recordType" = 'tags';
@@ -888,7 +888,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'childWithOnDeleteSetDefaults';
@@ -914,7 +914,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'childWithOnDeleteSetNulls';
@@ -940,7 +940,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'modelAs';
@@ -966,7 +966,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'modelBs';
@@ -992,7 +992,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'modelCs';
@@ -1018,7 +1018,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'parents';
@@ -1044,7 +1044,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'reminderTags';
@@ -1070,7 +1070,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'reminders';
@@ -1096,7 +1096,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."remindersListID"
                   AND "recordType" = 'remindersListAssets';
@@ -1122,7 +1122,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."remindersListID"
                   AND "recordType" = 'remindersListPrivates';
@@ -1148,7 +1148,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'remindersLists';
@@ -1174,7 +1174,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."id"
                   AND "recordType" = 'scopedModels';
@@ -1200,7 +1200,7 @@
                 SET "_isDeleted" = 1,
                   "_deletionOrigin" = CASE
                     WHEN "sqlitedata_icloud_syncEngineIsSynchronizingChanges"() THEN NULL
-                    WHEN EXISTS(SELECT 1 FROM sqlitedata_maintenanceContext) THEN 'maintenance'
+                    WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
                     ELSE 'user' END
                 WHERE "recordPrimaryKey" = "old"."title"
                   AND "recordType" = 'tags';
