@@ -44,6 +44,46 @@
     private let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
+    // Attempt-local bookkeeping only: engine identity isolates private/shared and replaced
+    // engines; UUIDs prevent a later request from inheriting an earlier request's errors.
+    // Entries live until the explicit fetch returns, not until the activity flag becomes idle.
+    private let fetchErrorReports = LockIsolated<[UUID: FetchErrorAttempt]>([:])
+
+    private struct FetchErrorAttempt {
+      let engineID: ObjectIdentifier
+      var reports: [FetchErrorReport] = []
+    }
+
+    private final class FetchErrorReport: Sendable {
+      let error: NSError
+      private let completion = LockIsolated<
+        (finished: Bool, waiters: [CheckedContinuation<Void, Never>])
+      >((false, []))
+
+      init(error: any Error) {
+        self.error = error as NSError
+      }
+
+      func wait() async {
+        await withCheckedContinuation { continuation in
+          let finished = completion.withValue {
+            if $0.finished { return true }
+            $0.waiters.append(continuation)
+            return false
+          }
+          if finished { continuation.resume() }
+        }
+      }
+
+      func finish() {
+        let waiters = completion.withValue {
+          $0.finished = true
+          defer { $0.waiters.removeAll() }
+          return $0.waiters
+        }
+        for waiter in waiters { waiter.resume() }
+      }
+    }
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
     #endif
@@ -584,6 +624,11 @@
     /// syncs your app's records. It is useful, however, in scenarios where you require more control
     /// over sync, such as pull-to-refresh.
     ///
+    /// Errors from either database are delivered to ``SyncEngineDelegate`` before they are
+    /// rethrown. The private and shared fetches remain concurrent; failure still cancels the
+    /// sibling operation according to structured concurrency. Cancellation errors are not
+    /// swallowed or converted into a successful fetch.
+    ///
     /// - Parameter options: The options to use when fetching changes.
     public func fetchChanges(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
@@ -596,11 +641,69 @@
       }
       guard let privateSyncEngine, let sharedSyncEngine
       else { return }
-      async let `private`: Void = privateSyncEngine.fetchChanges(options)
-      async let shared: Void = sharedSyncEngine.fetchChanges(options)
+      async let `private`: Void = fetchChanges(options, syncEngine: privateSyncEngine)
+      async let shared: Void = fetchChanges(options, syncEngine: sharedSyncEngine)
       _ = try await (`private`, shared)
       await handleFetchedRecordZoneChanges(syncEngine: privateSyncEngine)
       await handleFetchedRecordZoneChanges(syncEngine: sharedSyncEngine)
+    }
+
+    private func fetchChanges(
+      _ options: CKSyncEngine.FetchChangesOptions,
+      syncEngine: any SyncEngineProtocol
+    ) async throws {
+      let attemptID = UUID()
+      fetchErrorReports.withValue {
+        $0[attemptID] = FetchErrorAttempt(engineID: ObjectIdentifier(syncEngine))
+      }
+      defer { fetchErrorReports.withValue { $0[attemptID] = nil } }
+      do {
+        try await syncEngine.fetchChanges(options)
+      } catch {
+        // Only suppress an equal event error observed during this call on this engine.
+        // Do not collapse by CKError.Code: that would hide unrelated zone/partial failures.
+        let reports = fetchErrorReports.withValue { $0[attemptID]?.reports ?? [] }
+          .filter { $0.error.isEqual(error as NSError) }
+        if reports.isEmpty {
+          await delegate?.syncEngine(
+            self,
+            didReportError: error,
+            context: SyncEngineErrorContext(
+              operation: .fetchChanges,
+              databaseScope: syncEngine.database.databaseScope
+            )
+          )
+        } else {
+          // An event can be suspended inside the delegate when the explicit fetch throws.
+          // Cancellation must not let the throwing path escape that delivery boundary.
+          for report in reports { await report.wait() }
+        }
+        throw error
+      }
+    }
+
+    private func reportFetchError(
+      _ error: CKError,
+      zoneID: CKRecordZone.ID,
+      syncEngine: any SyncEngineProtocol
+    ) async {
+      let report = FetchErrorReport(error: error)
+      fetchErrorReports.withValue { attempts in
+        for id in Array(attempts.keys)
+        where attempts[id]?.engineID == ObjectIdentifier(syncEngine) {
+          attempts[id]?.reports.append(report)
+        }
+      }
+      defer { report.finish() }
+      await delegate?.syncEngine(
+        self,
+        didReportError: error,
+        context: SyncEngineErrorContext(
+          operation: .fetchRecordZoneChanges,
+          databaseScope: syncEngine.database.databaseScope,
+          zoneID: zoneID
+        )
+      )
     }
 
     /// Sends pending local changes to the server.
@@ -1105,7 +1208,10 @@
 
       case .willFetchRecordZoneChanges(let zoneID):
         await updateActivity(.fetchingZone(zoneID), isStarting: true, syncEngine: syncEngine)
-      case .didFetchRecordZoneChanges(let zoneID, _):
+      case .didFetchRecordZoneChanges(let zoneID, let error):
+        if let error {
+          await reportFetchError(error, zoneID: zoneID, syncEngine: syncEngine)
+        }
         await updateActivity(.fetchingZone(zoneID), isStarting: false, syncEngine: syncEngine)
 
       case .willFetchChanges:
