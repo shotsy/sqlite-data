@@ -216,6 +216,70 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func restoredValuesReachSecondDevice() async throws {
+        let secondDatabase = UserDatabase(database: try SQLiteDataTests.database(
+          containerIdentifier: try #require(container.containerIdentifier), attachMetadatabase: false
+        ))
+        let secondEngine = try await SyncEngine(
+          container: container, userDatabase: secondDatabase,
+          tables: [SynchronizedTable(for: RemindersList.self)]
+        )
+        defer { secondEngine.stop() }
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Original") }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let original = try container.privateCloudDatabase.record(for: RemindersList.recordID(for: 1))
+        await secondEngine.handleEvent(
+          .fetchedRecordZoneChanges(modifications: [original], deletions: []),
+          syncEngine: secondEngine.private
+        )
+        try await secondDatabase.userWrite { db throws in
+          #expect(try RemindersList.find(1).select(\.title).fetchOne(db) == "Original")
+        }
+
+        try await withDependencies {
+          $0.currentTime.now += 60
+        } operation: {
+          try await userDatabase.userWrite { db in
+            try SQLiteDataMaintenance.withScope(in: db) {
+              try RemindersList.find(1).delete().execute(db)
+            }
+            try db.seed { RemindersList(id: 1, title: "Restored changes") }
+            #expect(try SyncMetadata.select(\.userModificationTime).fetchOne(db) == 60)
+          }
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        }
+        let restored = try container.privateCloudDatabase.record(for: RemindersList.recordID(for: 1))
+        #expect(restored.encryptedValues["title"] as? String == "Restored changes")
+        await secondEngine.handleEvent(
+          .fetchedRecordZoneChanges(modifications: [restored], deletions: []),
+          syncEngine: secondEngine.private
+        )
+        try await secondDatabase.userWrite { db throws in
+          #expect(try RemindersList.find(1).select(\.title).fetchOne(db) == "Restored changes")
+        }
+        #expect(secondEngine.private.state.pendingRecordZoneChanges.isEmpty)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test($startImmediately.set(false))
+      func synchronizedRevivalPreservesModificationTime() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1) }
+          try RemindersList.find(1).delete().execute(db)
+        }
+        try await withDependencies {
+          $0.currentTime.now += 60
+        } operation: {
+          try await userDatabase.write { db in
+            try db.seed { RemindersList(id: 1, title: "Server") }
+            #expect(try SyncMetadata.select(\.userModificationTime).fetchOne(db) == 0)
+          }
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func reinsertionReplacesPendingDelete() async throws {
         try await userDatabase.userWrite { db in
           try db.seed { RemindersList(id: 1) }

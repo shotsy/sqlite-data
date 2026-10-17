@@ -180,7 +180,9 @@
     ) -> some StructuredQueriesCore.Statement {
       #sql("""
         UPDATE "sqlitedata_icloud_metadata"
-        SET "_isDeleted" = 0, "_deletionOrigin" = NULL
+        SET "_isDeleted" = 0, "_deletionOrigin" = NULL,
+          "userModificationTime" = CASE WHEN \(SyncEngine.$isSynchronizing)
+            THEN "userModificationTime" ELSE \($currentTime()) END
         WHERE "recordPrimaryKey" = \(new.primaryKey)
           AND "recordType" = \(quote: T.tableName, delimiter: .text)
           AND "_isDeleted" = 1
