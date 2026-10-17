@@ -51,12 +51,7 @@
             defaultZone: defaultZone,
             privateTables: privateTables
           )
-          SyncMetadata
-            .where {
-              $0.recordPrimaryKey.eq(#sql("\(old.primaryKey)"))
-                && $0.recordType.eq(tableName)
-            }
-            .update { $0._isDeleted = true }
+          SyncMetadata.tombstone(old: old)
         } when: { old, new in
           old.primaryKey.neq(new.primaryKey)
         }
@@ -84,6 +79,7 @@
             defaultZone: defaultZone,
             privateTables: privateTables
           )
+          SyncMetadata.revive(new: new)
         }
       )
     }
@@ -109,6 +105,7 @@
             defaultZone: defaultZone,
             privateTables: privateTables
           )
+          SyncMetadata.revive(new: new)
           SyncMetadata.update(
             new: new,
             parentForeignKey: parentForeignKey,
@@ -136,12 +133,7 @@
             defaultZone: defaultZone,
             privateTables: privateTables
           )
-          SyncMetadata
-            .where {
-              $0.recordPrimaryKey.eq(#sql("\(old.primaryKey)"))
-                && $0.recordType.eq(tableName)
-            }
-            .update { $0._isDeleted = true }
+          SyncMetadata.tombstone(old: old)
         } when: { _ in
           !SyncEngine.$isSynchronizing
         }
@@ -168,6 +160,35 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   extension SyncMetadata {
+    fileprivate static func tombstone<T: PrimaryKeyedTable, Name>(
+      old: StructuredQueriesCore.TableAlias<T, Name>.TableColumns
+    ) -> some StructuredQueriesCore.Statement {
+      #sql("""
+        UPDATE "sqlitedata_icloud_metadata"
+        SET "_isDeleted" = 1,
+          "_deletionOrigin" = CASE
+            WHEN \(SyncEngine.$isSynchronizing) THEN NULL
+            WHEN sqlitedata_maintenanceIsActive() THEN 'maintenance'
+            ELSE 'user' END
+        WHERE "recordPrimaryKey" = \(old.primaryKey)
+          AND "recordType" = \(quote: T.tableName, delimiter: .text)
+        """)
+    }
+
+    fileprivate static func revive<T: PrimaryKeyedTable, Name>(
+      new: StructuredQueriesCore.TableAlias<T, Name>.TableColumns
+    ) -> some StructuredQueriesCore.Statement {
+      #sql("""
+        UPDATE "sqlitedata_icloud_metadata"
+        SET "_isDeleted" = 0, "_deletionOrigin" = NULL,
+          "userModificationTime" = CASE WHEN \(SyncEngine.$isSynchronizing)
+            THEN "userModificationTime" ELSE \($currentTime()) END
+        WHERE "recordPrimaryKey" = \(new.primaryKey)
+          AND "recordType" = \(quote: T.tableName, delimiter: .text)
+          AND "_isDeleted" = 1
+        """)
+    }
+
     fileprivate static func insert<T: PrimaryKeyedTable, Name>(
       new: StructuredQueriesCore.TableAlias<T, Name>.TableColumns,
       parentForeignKey: ForeignKey?,
@@ -325,7 +346,8 @@
             )
           )
         } when: { old, new in
-          old._isDeleted.eq(new._isDeleted) && !SyncEngine.$isSynchronizing
+          (old._isDeleted.eq(new._isDeleted) || !new._isDeleted)
+            && !SyncEngine.$isSynchronizing
         }
       )
     }

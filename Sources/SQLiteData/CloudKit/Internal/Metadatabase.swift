@@ -142,6 +142,11 @@
       )
       .execute(db)
     }
+    migrator.registerMigration("Add Deletion Origin") { db in
+      try db.execute(sql: """
+        ALTER TABLE sqlitedata_icloud_metadata ADD COLUMN _deletionOrigin TEXT
+        """)
+    }
     #if DEBUG
       try metadatabase.read { db in
         let hasSchemaChanges = try migrator.hasSchemaChanges(db)
