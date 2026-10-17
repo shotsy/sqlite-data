@@ -365,6 +365,7 @@
       db.add(function: $currentZoneName)
       db.add(function: $currentOwnerName)
 
+      try SQLiteDataMaintenance.install(in: db)
       for trigger in SyncMetadata.callbackTriggers(for: self) {
         try trigger.execute(db)
       }
@@ -1302,6 +1303,33 @@
       var changes = syncEngine.state.pendingRecordZoneChanges.filter(options.scope.contains)
       guard !changes.isEmpty
       else { return [] }
+
+      // A same-ID reinsertion (or a rolled-back delete) supersedes a queued deletion.
+      // Consult durable metadata here too, since stopped-engine callbacks enqueue asynchronously.
+      let candidateDeletes: [CKRecord.ID] = changes.compactMap {
+        if case .deleteRecord(let id) = $0 { return id }
+        return nil
+      }
+      if !candidateDeletes.isEmpty {
+        let revivedRecordIDs = await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await metadatabase.read { db in
+            try SyncMetadata.findAll(candidateDeletes)
+              .where { !$0._isDeleted }
+              .fetchAll(db)
+              .map {
+                CKRecord.ID(
+                  recordName: $0.recordName,
+                  zoneID: CKRecordZone.ID(zoneName: $0.zoneName, ownerName: $0.ownerName)
+                )
+              }
+          }
+        } ?? []
+        let supersededDeletes = revivedRecordIDs.map {
+          CKSyncEngine.PendingRecordZoneChange.deleteRecord($0)
+        }
+        syncEngine.state.remove(pendingRecordZoneChanges: supersededDeletes)
+        changes.removeAll { supersededDeletes.contains($0) }
+      }
 
       let deletedRecordIDs: [CKRecord.ID] = changes.compactMap {
         switch $0 {

@@ -19,7 +19,7 @@ struct MaintenanceTests {
       let value: Int? = try SQLiteDataMaintenance.withScope(in: db) {
         #expect(try isActive(db))
         try db.execute(sql: "INSERT INTO effects VALUES (1)")
-        try SQLiteDataMaintenance.withScope(in: db) {
+        try SQLiteDataMaintenance.withScope(in: db) { () throws in
           #expect(try isActive(db))
         }
         #expect(try isActive(db))
@@ -43,7 +43,7 @@ struct MaintenanceTests {
       }
       #expect(try !isActive(db))
       #expect(try Int.fetchAll(db, sql: "SELECT value FROM effects") == [1])
-      try db.inTransaction {
+      try db.inTransaction { () throws in
         #expect(try SQLiteDataMaintenance.withScope(in: db) {
           try db.execute(sql: "INSERT INTO effects VALUES (4)")
           return 42

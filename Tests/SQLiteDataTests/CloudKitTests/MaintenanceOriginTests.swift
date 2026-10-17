@@ -25,10 +25,10 @@
           #expect(try deletionOrigins(db) == ["maintenance", "user"])
           #expect(try SyncMetadata.where(\._isDeleted).count().fetchOne(db) == 2)
         }
-        syncEngine.private.state.assertPendingRecordZoneChanges([
+        #expect(Set(syncEngine.private.state.pendingRecordZoneChanges) == Set([
           .deleteRecord(RemindersList.recordID(for: 1)),
           .deleteRecord(RemindersList.recordID(for: 2)),
-        ])
+        ]))
         // A fresh connection reads the durable origins, not connection-local state.
         let reopened = try DatabaseQueue(path: syncEngine.metadatabase.path)
         try await reopened.read { db throws in
@@ -38,9 +38,44 @@
         try await syncEngine.metadatabase.read { db throws in
           #expect(try SyncMetadata.count().fetchOne(db) == 0)
         }
-        let cloud = container.privateCloudDatabase as! MockCloudDatabase
+        let cloud = container.privateCloudDatabase
         #expect(throws: CKError.self) { try cloud.record(for: RemindersList.recordID(for: 1)) }
         #expect(throws: CKError.self) { try cloud.record(for: RemindersList.recordID(for: 2)) }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func reinsertionReplacesPendingDelete() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1) }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        try await userDatabase.userWrite { db in
+          try SQLiteDataMaintenance.withScope(in: db) {
+            try RemindersList.find(1).delete().execute(db)
+          }
+          try db.seed { RemindersList(id: 1, title: "Restored") }
+          #expect(try deletionOrigins(db) == ["live"])
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let record = try container.privateCloudDatabase.record(for: RemindersList.recordID(for: 1))
+        #expect(record.encryptedValues["title"] as? String == "Restored")
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).delete().execute(db)
+          #expect(try deletionOrigins(db) == ["user"])
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test($startImmediately.set(false))
+      func synchronizedPrimaryKeyChangeIsNotUserOrigin() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1) }
+        }
+        try await userDatabase.write { db in
+          try db.execute(sql: "UPDATE remindersLists SET id = 2 WHERE id = 1")
+          #expect(try deletionOrigins(db) == ["legacy", "live"])
+        }
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
