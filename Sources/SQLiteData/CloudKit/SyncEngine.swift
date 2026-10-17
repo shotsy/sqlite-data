@@ -33,6 +33,7 @@
     package let tablesByOrder: [String: Int]
     let foreignKeysByTableName: [String: [ForeignKey]]
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
+    package let settlement = SyncSettlement()
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -403,6 +404,9 @@
     /// Determines if the sync engine is currently processing changes being sent to the device
     /// from CloudKit.
     ///
+    /// This is an activity indicator, not a completion barrier: final record application and
+    /// delegate reports can outlive it. Use ``waitForSettlement()`` for completion evidence.
+    ///
     /// It is an observable value, which means if it is accessed in a SwiftUI view, or some other
     /// observable context, then the view will automatically re-render when the value changes. As
     /// such, it can be useful for displaying a progress view to indicate that work is currently
@@ -438,6 +442,7 @@
         observationRegistrar.withMutation(of: self, keyPath: \.isSendingChanges) {
           observationRegistrar.withMutation(of: self, keyPath: \.isFetchingChanges) {
             syncEngines.withValue {
+              settlement.stop()
               $0 = SyncEngines()
             }
           }
@@ -455,15 +460,22 @@
 
     private func start() throws -> Task<Void, Never> {
       guard !isRunning else { return Task {} }
-      observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
+      let lifetime: UUID? = observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         syncEngines.withValue {
+          guard !$0.isRunning else { return nil }
+          settlement.begin()
+          let lifetime = settlement.start()
           let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
           $0 = SyncEngines(
             private: privateSyncEngine,
             shared: sharedSyncEngine
           )
+          return lifetime
         }
       }
+      guard let lifetime else { return Task {} }
+      var handedOff = false
+      defer { if !handedOff { settlement.end() } }
 
       let previousRecordTypes = try metadatabase.read { db in
         try RecordType.all.fetchAll(db)
@@ -531,6 +543,7 @@
         }
       #endif
       let startTask = Task<Void, Never> {
+        defer { settlement.end() }
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           guard try await container.accountStatus() == .available
           else { return }
@@ -549,9 +562,16 @@
           await scheduleDurableRecordZoneFailureRetries()
         }
       }
-      self.startTask.withValue {
-        $0?.cancel()
-        $0 = startTask
+      handedOff = true
+      syncEngines.withValue { _ in
+        guard (try? settlement.currentLifetime()) == lifetime else {
+          startTask.cancel()
+          return
+        }
+        self.startTask.withValue {
+          $0?.cancel()
+          $0 = startTask
+        }
       }
       return startTask
     }
@@ -567,6 +587,8 @@
     public func fetchChanges(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
     ) async throws {
+      settlement.begin()
+      defer { settlement.end() }
       await startTask.withValue(\.self)?.value
       let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
         ($0.private, $0.shared)
@@ -591,6 +613,8 @@
     public func sendChanges(
       _ options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws {
+      settlement.begin()
+      defer { settlement.end() }
       await startTask.withValue(\.self)?.value
       let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
         ($0.private, $0.shared)
@@ -764,6 +788,8 @@
     /// > Important: It is only appropriate to call this method when the device's iCloud account
     /// > logs out or changes.
     public func deleteLocalData() async throws {
+      settlement.begin()
+      defer { settlement.end() }
       stop()
       try tearDownSyncEngine()
       await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -891,6 +917,8 @@
     }
 
     package func acceptShare(metadata: ShareMetadata) async throws {
+      settlement.begin()
+      defer { settlement.end() }
       guard let rootRecordID = metadata.hierarchicalRootRecordID
       else {
         reportIssue("Attempting to share without root record information.")
@@ -1028,6 +1056,15 @@
     }
 
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
+      // Register before any actor hop, atomically with engine retirement. The final did-fetch
+      // event owns its lifecycle count until application and all awaited reports return.
+      syncEngines.withValue {
+        settlement.beginEvent(
+          event, engine: syncEngine,
+          isCurrent: $0.private === syncEngine || $0.shared === syncEngine
+        )
+      }
+      defer { settlement.endEvent(event, engine: syncEngine) }
       #if DEBUG
         logger.log(event, syncEngine: syncEngine)
       #endif
@@ -1102,6 +1139,8 @@
       options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions(scope: .all),
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+      settlement.begin()
+      defer { settlement.end() }
       var changes = await pendingRecordZoneChanges(options: options, syncEngine: syncEngine)
       guard !changes.isEmpty
       else { return nil }
@@ -1528,6 +1567,8 @@
       deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)] = [],
       syncEngine: any SyncEngineProtocol
     ) async {
+      settlement.begin()
+      defer { settlement.end() }
       let protectedRecordIDs: (Set<CKRecord.ID>, Set<CKRecord.ID>) =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await metadatabase.read { db in
