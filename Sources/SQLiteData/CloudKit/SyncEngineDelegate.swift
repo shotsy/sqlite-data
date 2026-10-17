@@ -6,6 +6,10 @@
   /// The sync operation during which a reported ``SyncEngine`` error occurred.
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   public enum SyncEngineOperation: String, Sendable, Equatable {
+    /// An explicit fetch of remote changes threw an error.
+    case fetchChanges = "fetchChanges"
+    /// A CloudKit record-zone download completed with an error.
+    case fetchRecordZoneChanges = "didFetchRecordZoneChanges"
     /// A locally-changed record failed to save to CloudKit.
     case sentRecordSave = "handleSentRecordZoneChanges.saveRecords"
     /// A locally-deleted record failed to delete from CloudKit.
@@ -38,22 +42,34 @@
   public struct SyncEngineErrorContext: Sendable {
     public let operation: String
     public let operationKind: SyncEngineOperation?
+    /// The engine's recovery action, when known. Download reporting leaves this nil because
+    /// it neither changes pending records nor makes a retry decision.
     public let disposition: SyncEngineErrorDisposition?
+    /// The database in which the failure occurred, when known.
+    public let databaseScope: CKDatabase.Scope?
+    /// The zone whose download failed. Explicit database-wide fetches leave this nil.
+    public let zoneID: CKRecordZone.ID?
     public let tableName: String?
     public let recordType: String?
     public let isRemoteDelete: Bool
     public let isLocalSaveFailure: Bool
     public let isLocalDeleteFailure: Bool
 
+    /// Creates typed context. Scope and zone default to nil for existing record-application
+    /// and upload callers; download reports populate them when CloudKit supplies that detail.
     public init(
       operation: SyncEngineOperation,
-      disposition: SyncEngineErrorDisposition,
+      disposition: SyncEngineErrorDisposition? = nil,
       tableName: String? = nil,
       recordType: String? = nil,
       isRemoteDelete: Bool = false,
       isLocalSaveFailure: Bool = false,
-      isLocalDeleteFailure: Bool = false
+      isLocalDeleteFailure: Bool = false,
+      databaseScope: CKDatabase.Scope? = nil,
+      zoneID: CKRecordZone.ID? = nil
     ) {
+      self.databaseScope = databaseScope
+      self.zoneID = zoneID
       self.operation = operation.rawValue
       self.operationKind = operation
       self.disposition = disposition
@@ -64,14 +80,20 @@
       self.isLocalDeleteFailure = isLocalDeleteFailure
     }
 
+    /// Creates context for a string operation, retaining compatibility with custom operations.
+    /// Known operation raw values also populate `operationKind`.
     public init(
       operation: String,
       tableName: String? = nil,
       recordType: String? = nil,
       isRemoteDelete: Bool = false,
       isLocalSaveFailure: Bool = false,
-      isLocalDeleteFailure: Bool = false
+      isLocalDeleteFailure: Bool = false,
+      databaseScope: CKDatabase.Scope? = nil,
+      zoneID: CKRecordZone.ID? = nil
     ) {
+      self.databaseScope = databaseScope
+      self.zoneID = zoneID
       self.operation = operation
       self.operationKind = SyncEngineOperation(rawValue: operation)
       self.disposition = nil
@@ -183,6 +205,16 @@
     /// SQLiteData may recover from or swallow these errors after reporting them via
     /// `withErrorReporting`. This hook lets applications mirror important failures into their own
     /// telemetry pipelines without changing sync behavior.
+    ///
+    /// Download errors are also delivered here, before a zone's fetching activity ends. Explicit
+    /// fetches still throw the original error (including cancellation) after awaiting this hook.
+    /// Their disposition is nil: reporting does not decide CloudKit's retry policy.
+    ///
+    /// Within an explicit fetch on one engine, an error equal under `NSError.isEqual` to an
+    /// already-reported zone error is not reported again by the throwing path. That path awaits
+    /// the zone report's completion. Distinct errors (including unequal partial-error wrappers),
+    /// other engines, and later fetch attempts are not deduplicated. Events arriving only after
+    /// the explicit call finishes are independent reports; no time-based suppression is used.
     func syncEngine(
       _ syncEngine: SyncEngine,
       didReportError error: any Error,
