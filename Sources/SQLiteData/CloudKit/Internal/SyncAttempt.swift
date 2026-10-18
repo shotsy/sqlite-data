@@ -38,7 +38,7 @@
     public func fetchChangesWithReceipt(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
     ) async throws -> AttemptReceipt {
-      try await runAttempt(receipt: true) { try await self.performFetchChanges(options) }!
+      try await runAttempt(receipt: true) { try await self.performFetchChanges(options, work: $0) }!
     }
 
     /// Sends and returns a settled receipt with the same attribution and cancellation rules as
@@ -47,27 +47,29 @@
     public func sendChangesWithReceipt(
       _ options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws -> AttemptReceipt {
-      try await runAttempt(receipt: true) { try await self.performSendChanges(options) }!
+      try await runAttempt(receipt: true) { try await self.performSendChanges(options, work: $0) }!
     }
 
     @TaskLocal static var attemptOwners: [SyncAttempt] = []
 
     func runAttempt(
-      receipt: Bool, operation: @Sendable () async throws -> Void
+      receipt: Bool, epoch: UUID? = nil, operation: @Sendable (Work) async throws -> Void
     ) async throws -> AttemptReceipt? {
-      let (lifetime, attempt) = try settlement.withAdmission {
+      let (lifetime, attempt, work) = try settlement.withAdmission {
+        guard admits(epoch: epoch) else { throw CancellationError() }
+        let work = try captureWork()
         let lifetime = receipt ? try settlement.currentLifetime() : nil
         let busy = settlement.hasWork
         let attempt = attempts.begin(
-          engines: syncEngines.withValue { [$0.private, $0.shared].compactMap { $0 } })
+          engines: [work.engines.private, work.engines.shared].compactMap { $0 })
         if busy { attempt.state.withValue { $0.uncertain = true } }
         settlement.begin()
-        return (lifetime, attempt)
+        return (lifetime, attempt, work)
       }
       defer { attempts.remove(attempt) }
       var operationError: (any Error)?
       await Self.$attemptOwners.withValue([attempt]) {
-        do { try await operation() } catch { operationError = error }
+        do { try await operation(work) } catch { operationError = error }
       }
       await deliverAttemptFailures([attempt])
       settlement.end()

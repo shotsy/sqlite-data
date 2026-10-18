@@ -36,6 +36,8 @@
     package let settlement = SyncSettlement()
     let attempts = SyncAttempts()
     let retirementUploads = RetirementUploads()
+    let drainState = SyncDrain()
+    let mutationTails = SyncMutationTails()
     // Account ownership is independent of stop/start lifetimes. Only reset advances it,
     // on the user writer; validation and mutations must share that same writer turn.
     // Never acquire settlement from the writer: a lease consumer can be waiting on it.
@@ -90,6 +92,7 @@
       }
     }
     private let transfers = LockIsolated<[TransferKey: Transfer]>([:])
+    func clearRetiredTransfers() { transfers.withValue { $0.removeAll() } }
     @TaskLocal private static var eventTransfer: Transfer?
     @TaskLocal private static var isTransferEvent = false
 
@@ -449,15 +452,19 @@
             forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: nil
-          ) { [syncEngines] _ in
+          ) { [weak self] _ in
+            guard let self else { return }
+            let work = self.settlement.withAdmission { () -> Work? in
+              guard let work = try? self.captureWork() else { return nil }
+              self.settlement.begin()
+              return work
+            }
+            guard let work else { return }
             _ = Task { @MainActor in
+              defer { self.settlement.end() }
               let taskIdentifier = UIApplication.shared.beginBackgroundTask()
               defer { UIApplication.shared.endBackgroundTask(taskIdentifier) }
-              let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
-                ($0.private, $0.shared)
-              }
-              try await privateSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
-              try await sharedSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
+              try await self.performSendChanges(CKSyncEngine.SendChangesOptions(), work: work)
             }
           }
         }
@@ -628,13 +635,14 @@
       }
     }
 
-    private func start() throws -> Task<Void, Never> {
+    private func start(expectedDrainEpoch: UUID? = nil) throws -> Task<Void, Never> {
       // Capture and install atomically with reset admission, before reading cached data.
       // A generation alone is insufficient while reset still contains old-account rows.
-      let ownership: (lifetime: UUID, generation: UUID)? =
+      let ownership: (lifetime: UUID, generation: UUID, work: Work)? =
         try observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
           try settlement.withAdmission {
-            guard accountResetState.value == .ready else { throw CancellationError() }
+            if let expectedDrainEpoch, !admits(epoch: expectedDrainEpoch) { return nil }
+            guard admits(), accountResetState.value == .ready else { throw CancellationError() }
             return syncEngines.withValue {
               guard !$0.isRunning else { return nil }
               settlement.begin()
@@ -645,13 +653,16 @@
                 shared: sharedSyncEngine
               )
               retirementUploads.register($0)
-              return (lifetime, accountGeneration.value)
+              let completion = SyncCompletion()
+              drainState.state.withValue { $0.startup = completion }
+              return (lifetime, accountGeneration.value,
+                Work(engines: $0, startup: completion, epoch: drainState.state.epoch))
             }
           }
         }
-      guard let (lifetime, accountGeneration) = ownership else { return Task {} }
+      guard let (lifetime, accountGeneration, work) = ownership else { return Task {} }
       var handedOff = false
-      defer { if !handedOff { settlement.end() } }
+      defer { if !handedOff { work.startup?.finish(); settlement.end() } }
 
       let previousRecordTypes = try metadatabase.read { db in
         try RecordType.all.fetchAll(db)
@@ -711,7 +722,10 @@
                 while true {
                   guard let self else { break }
                   try await clock.sleep(for: .seconds(1))
-                  try await self.syncChanges()
+                  _ = try await self.runAttempt(receipt: false, epoch: work.epoch) { work in
+                    try await self.performSendChanges(CKSyncEngine.SendChangesOptions(), work: work)
+                    try await self.performFetchChanges(CKSyncEngine.FetchChangesOptions(), work: work)
+                  }
                 }
               }
             }
@@ -719,17 +733,16 @@
         }
       #endif
       let startTask = Task<Void, Never> {
-        defer { settlement.end() }
+        defer { work.startup?.finish(); settlement.end() }
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           guard try await container.accountStatus() == .available
           else { return }
           try await userDatabase.write { _ in
             guard self.accountGeneration.value == accountGeneration else { return }
-            syncEngines.withValue {
-              $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
-            }
+            work.engines.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
           }
           try await uploadRecordsToCloudKit(
+            engines: work.engines,
             previousRecordTypeByTableName: previousRecordTypeByTableName,
             currentRecordTypeByTableName: currentRecordTypeByTableName,
             accountGeneration: accountGeneration
@@ -741,7 +754,8 @@
           )
           try await cacheUserTables(
             recordTypes: currentRecordTypes, accountGeneration: accountGeneration)
-          await scheduleDurableRecordZoneFailureRetries(accountGeneration: accountGeneration)
+          await scheduleDurableRecordZoneFailureRetries(
+            accountGeneration: accountGeneration, epoch: work.epoch)
         }
       }
       handedOff = true
@@ -776,16 +790,12 @@
     public func fetchChanges(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
     ) async throws {
-      _ = try await runAttempt(receipt: false) { try await self.performFetchChanges(options) }
+      _ = try await runAttempt(receipt: false) { try await self.performFetchChanges(options, work: $0) }
     }
 
-    func performFetchChanges(_ options: CKSyncEngine.FetchChangesOptions) async throws {
-      settlement.begin()
-      defer { settlement.end() }
-      await startTask.withValue(\.self)?.value
-      let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
-        ($0.private, $0.shared)
-      }
+    func performFetchChanges(_ options: CKSyncEngine.FetchChangesOptions, work: Work) async throws {
+      let engines = try await operationEngines(work)
+      let (privateSyncEngine, sharedSyncEngine) = (engines.private, engines.shared)
       guard let privateSyncEngine, let sharedSyncEngine
       else { return }
       let privateWindow = beginTransfer(privateSyncEngine, explicit: true)
@@ -796,8 +806,8 @@
         async let shared: Void = fetchChanges(
           options, syncEngine: sharedSyncEngine, window: sharedWindow)
         _ = try await (`private`, shared)
-        await handleFetchedRecordZoneChanges(syncEngine: privateSyncEngine)
-        await handleFetchedRecordZoneChanges(syncEngine: sharedSyncEngine)
+        await handleFetchedRecordZoneChangesAdmitted(syncEngine: privateSyncEngine)
+        await handleFetchedRecordZoneChangesAdmitted(syncEngine: sharedSyncEngine)
       } catch {
         for (engine, window) in [
           (privateSyncEngine, privateWindow), (sharedSyncEngine, sharedWindow),
@@ -893,16 +903,12 @@
     public func sendChanges(
       _ options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws {
-      _ = try await runAttempt(receipt: false) { try await self.performSendChanges(options) }
+      _ = try await runAttempt(receipt: false) { try await self.performSendChanges(options, work: $0) }
     }
 
-    func performSendChanges(_ options: CKSyncEngine.SendChangesOptions) async throws {
-      settlement.begin()
-      defer { settlement.end() }
-      await startTask.withValue(\.self)?.value
-      let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
-        ($0.private, $0.shared)
-      }
+    func performSendChanges(_ options: CKSyncEngine.SendChangesOptions, work: Work) async throws {
+      let engines = try await operationEngines(work)
+      let (privateSyncEngine, sharedSyncEngine) = (engines.private, engines.shared)
       guard let privateSyncEngine, let sharedSyncEngine
       else { return }
       let privateWindow = beginTransfer(privateSyncEngine, upload: true, explicit: true)
@@ -941,8 +947,10 @@
       fetchOptions: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions(),
       sendOptions: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws {
-      try await sendChanges(sendOptions)
-      try await fetchChanges(fetchOptions)
+      _ = try await runAttempt(receipt: false) { work in
+        try await self.performSendChanges(sendOptions, work: work)
+        try await self.performFetchChanges(fetchOptions, work: work)
+      }
     }
 
     private func cacheUserTables(recordTypes: [RecordType], accountGeneration: UUID) async throws {
@@ -955,11 +963,12 @@
     }
 
     private func uploadRecordsToCloudKit(
+      engines: SyncEngines,
       previousRecordTypeByTableName: [String: RecordType],
       currentRecordTypeByTableName: [String: RecordType],
       accountGeneration: UUID
     ) async throws {
-      try await enqueueLocallyPendingChanges(accountGeneration: accountGeneration)
+      try await enqueueLocallyPendingChanges(engines: engines, accountGeneration: accountGeneration)
       try await userDatabase.write { db in
         guard self.accountGeneration.value == accountGeneration else { return }
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
@@ -992,8 +1001,7 @@
       }
     }
 
-    private func enqueueLocallyPendingChanges(accountGeneration: UUID) async throws {
-      let engines = syncEngines.withValue { $0 }
+    private func enqueueLocallyPendingChanges(engines: SyncEngines, accountGeneration: UUID) async throws {
       try await userDatabase.write { db in
         guard self.accountGeneration.value == accountGeneration else { return }
         let changes = try PendingRecordZoneChange.select(\.pendingRecordZoneChange).fetchAll(db)
@@ -1124,10 +1132,16 @@
     /// Concurrent resets throw `CancellationError`. If cleanup fails, the error is rethrown
     /// and startup remains disabled until a subsequent call successfully completes cleanup.
     public func deleteLocalData() async throws {
-      try settlement.withAdmission {
-        guard accountResetState.value != .resetting else { throw CancellationError() }
+      let epoch = try settlement.withAdmission {
+        guard admits(), accountResetState.value != .resetting else { throw CancellationError() }
+        if let owner = Self.accountOwner, owner.owner == ObjectIdentifier(self) {
+          guard owner.epoch == drainState.state.epoch else {
+            throw CancellationError()
+          }
+        }
         accountResetState.setValue(.resetting)
         settlement.begin()
+        return drainState.state.epoch
       }
       var cleanedUp = false
       defer {
@@ -1151,7 +1165,7 @@
       // triggers are reinstalled. A concurrent start from here sees only the new account.
       settlement.withAdmission { accountResetState.setValue(.ready) }
       cleanedUp = true
-      try await start()
+      try await start(expectedDrainEpoch: epoch).value
     }
 
     @DatabaseFunction(
@@ -1198,31 +1212,16 @@
         )
       }
 
-      guard isRunning else {
-        // TODO: Perform this work in a trigger instead of a task.
-        Task { [changes = oldChanges + newChanges] in
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert {
-                  for change in changes {
-                    PendingRecordZoneChange(change)
-                  }
-                }
-                .execute(db)
-            }
-          }
+      syncEngines.withValue { [oldChanges, newChanges] engines in
+        guard engines.isRunning else {
+          persistMutationTail(oldChanges + newChanges)
+          return
         }
-        return
+        let oldEngine = oldZoneID.ownerName == CKCurrentUserDefaultName ? engines.private : engines.shared
+        let engine = zoneID.ownerName == CKCurrentUserDefaultName ? engines.private : engines.shared
+        oldEngine?.state.add(pendingRecordZoneChanges: oldChanges)
+        engine?.state.add(pendingRecordZoneChanges: newChanges)
       }
-      let oldSyncEngine = self.syncEngines.withValue {
-        oldZoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      let syncEngine = self.syncEngines.withValue {
-        zoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      oldSyncEngine?.state.add(pendingRecordZoneChanges: oldChanges)
-      syncEngine?.state.add(pendingRecordZoneChanges: newChanges)
     }
 
     @DatabaseFunction(
@@ -1243,27 +1242,43 @@
       if let share {
         changes.append(.deleteRecord(share.recordID))
       }
-      guard isRunning else {
-        Task { [changes] in
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert { changes.map { PendingRecordZoneChange($0) } }
-                .execute(db)
-            }
-          }
+      syncEngines.withValue { [changes] engines in
+        guard engines.isRunning else {
+          persistMutationTail(changes)
+          return
         }
-        return
+        let engine = zoneID.ownerName == CKCurrentUserDefaultName ? engines.private : engines.shared
+        engine?.state.add(pendingRecordZoneChanges: changes)
       }
+    }
 
-      let syncEngine = self.syncEngines.withValue {
-        zoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
+    private func persistMutationTail(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      let tail = mutationTails.begin(changes, generation: accountGeneration.value)
+      Task {
+        defer { mutationTails.end(tail) }
+        await withErrorReporting(.sqliteDataCloudKitFailure) { try await flushMutationTails() }
       }
-      syncEngine?.state.add(pendingRecordZoneChanges: changes)
+    }
+
+    func flushMutationTails() async throws {
+      try await userDatabase.write { db in
+        let entries = mutationTails.state.value.entries
+        guard !entries.isEmpty else { return }
+        let changes = entries.filter { $0.generation == accountGeneration.value }.flatMap(\.changes)
+        try PendingRecordZoneChange.insert { changes.map { PendingRecordZoneChange($0) } }.execute(db)
+        db.afterNextTransaction { _ in
+          let ids = Set(entries.map(\.id))
+          self.mutationTails.state.withValue { $0.entries.removeAll { ids.contains($0.id) } }
+        }
+      }
     }
 
     package func acceptShare(metadata: ShareMetadata) async throws {
-      settlement.begin()
+      let work = try settlement.withAdmission {
+        let work = try captureWork()
+        settlement.begin()
+        return work
+      }
       defer { settlement.end() }
       guard let rootRecordID = metadata.hierarchicalRootRecordID
       else {
@@ -1272,7 +1287,7 @@
       }
       let container = type(of: container).createContainer(identifier: metadata.containerIdentifier)
       _ = try await container.accept(metadata)
-      try await syncEngines.shared?.fetchChanges(
+      try await work.engines.shared?.fetchChanges(
         CKSyncEngine.FetchChangesOptions(
           scope: .zoneIDs([rootRecordID.zoneID]),
           operationGroup: nil
@@ -1404,15 +1419,19 @@
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
       // Register before any actor hop, atomically with engine retirement. The final did-fetch
       // event owns its lifecycle count until application and all awaited reports return.
-      let owners = settlement.withAdmission {
+      let admission = settlement.withAdmission { () -> ([SyncAttempt], AccountOwner)? in
+        guard admits(syncEngine) else { return nil }
+        let owner = AccountOwner(owner: ObjectIdentifier(self), epoch: drainState.state.epoch,
+          isPrivate: syncEngines.value.private === syncEngine)
         syncEngines.withValue {
           settlement.beginEvent(
             event, engine: syncEngine,
             isCurrent: $0.private === syncEngine || $0.shared === syncEngine
           )
         }
-        return attempts.admit(syncEngine, event: event)
+        return (attempts.admit(syncEngine, event: event), owner)
       }
+      guard let (owners, owner) = admission else { return }
       defer {
         attempts.end(syncEngine)
         settlement.endEvent(event, engine: syncEngine)
@@ -1436,8 +1455,10 @@
       await Self.$isTransferEvent.withValue(true) {
         await Self.$eventTransfer.withValue(activeTransfer) {
           await Self.$attemptOwners.withValue(owners) {
-            await handleTransferEvent(event, syncEngine: syncEngine)
-            await deliverAttemptFailures(owners)
+            await Self.$accountOwner.withValue(owner) {
+              await handleTransferEvent(event, syncEngine: syncEngine)
+              await deliverAttemptFailures(owners)
+            }
           }
         }
       }
@@ -1450,12 +1471,12 @@
 
       switch event {
       case .accountChange(let changeType):
-        await handleAccountChange(changeType: changeType, syncEngine: syncEngine)
+        await handleAccountChangeAdmitted(changeType: changeType, syncEngine: syncEngine)
       case .stateUpdate(let stateSerialization):
-        await handleStateUpdate(stateSerialization: stateSerialization, syncEngine: syncEngine)
+        await handleStateUpdateAdmitted(stateSerialization: stateSerialization, syncEngine: syncEngine)
       case .fetchedDatabaseChanges(let modifications, let deletions):
         if !deletions.isEmpty { transfer(syncEngine)?.mark(.unconfirmed) }
-        await handleFetchedDatabaseChanges(
+        await handleFetchedDatabaseChangesAdmitted(
           modifications: modifications,
           deletions: deletions,
           syncEngine: syncEngine
@@ -1471,7 +1492,7 @@
               zoneID: zoneID))
         }
       case .fetchedRecordZoneChanges(let modifications, let deletions):
-        await handleFetchedRecordZoneChanges(
+        await handleFetchedRecordZoneChangesAdmitted(
           modifications: modifications,
           deletions: deletions,
           syncEngine: syncEngine
@@ -1482,7 +1503,7 @@
         let deletedRecordIDs,
         let failedRecordDeletes
       ):
-        await handleSentRecordZoneChanges(
+        await handleSentRecordZoneChangesAdmitted(
           savedRecords: savedRecords,
           failedRecordSaves: failedRecordSaves,
           deletedRecordIDs: deletedRecordIDs,
@@ -1504,7 +1525,7 @@
         await updateActivity(.fetching, isStarting: true, syncEngine: syncEngine)
       case .didFetchChanges:
         await Self.$isTransferEvent.withValue(false) {
-          await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
+          await handleFetchedRecordZoneChangesAdmitted(syncEngine: syncEngine)
         }
         await finishTransfer(syncEngine)
         await updateActivity(.fetching, isStarting: false, syncEngine: syncEngine)
@@ -1537,10 +1558,12 @@
       options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions(scope: .all),
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
-      let owners = settlement.withAdmission {
+      let admission = settlement.withAdmission { () -> [SyncAttempt]? in
+        guard admits(syncEngine) else { return nil }
         settlement.begin()
         return attempts.admit(syncEngine)
       }
+      guard let owners = admission else { return nil }
       defer {
         attempts.end(syncEngine)
         settlement.end()
@@ -1608,7 +1631,11 @@
 
       let owners = Self.attemptOwners
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
-        settlement.begin()
+        guard settlement.withAdmission({
+          guard admits(syncEngine) else { return false }
+          settlement.begin()
+          return true
+        }) else { return nil }
         defer { settlement.end() }
         let record = await Self.$attemptOwners.withValue(owners) { () async -> CKRecord? in
         guard
@@ -1853,9 +1880,13 @@
       changeType: CKSyncEngine.Event.AccountChange.ChangeType,
       syncEngine: any SyncEngineProtocol
     ) async {
-      guard syncEngine === syncEngines.private
-      else { return }
+      await handleEvent(.accountChange(changeType: changeType), syncEngine: syncEngine)
+    }
 
+    private func handleAccountChangeAdmitted(
+      changeType: CKSyncEngine.Event.AccountChange.ChangeType, syncEngine: any SyncEngineProtocol
+    ) async {
+      guard Self.accountOwner?.isPrivate == true else { return }
       attempts.invalidate()
       transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
       switch changeType {
@@ -1884,6 +1915,12 @@
       stateSerialization: CKSyncEngine.State.Serialization,
       syncEngine: any SyncEngineProtocol
     ) async {
+      await handleEvent(.stateUpdate(stateSerialization: stateSerialization), syncEngine: syncEngine)
+    }
+
+    private func handleStateUpdateAdmitted(
+      stateSerialization: CKSyncEngine.State.Serialization, syncEngine: any SyncEngineProtocol
+    ) async {
       await withAttemptErrorReporting(
         SyncEngineErrorContext(
           operation: "stateUpdate", databaseScope: syncEngine.database.databaseScope)
@@ -1901,6 +1938,15 @@
     }
 
     package func handleFetchedDatabaseChanges(
+      modifications: [CKRecordZone.ID],
+      deletions: [(zoneID: CKRecordZone.ID, reason: CKDatabase.DatabaseChange.Deletion.Reason)],
+      syncEngine: any SyncEngineProtocol
+    ) async {
+      await handleEvent(.fetchedDatabaseChanges(modifications: modifications, deletions: deletions),
+        syncEngine: syncEngine)
+    }
+
+    private func handleFetchedDatabaseChangesAdmitted(
       modifications: [CKRecordZone.ID],
       deletions: [(zoneID: CKRecordZone.ID, reason: CKDatabase.DatabaseChange.Deletion.Reason)],
       syncEngine: any SyncEngineProtocol
@@ -2051,8 +2097,15 @@
       deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)] = [],
       syncEngine: any SyncEngineProtocol
     ) async {
-      settlement.begin()
-      defer { settlement.end() }
+      await handleEvent(.fetchedRecordZoneChanges(modifications: modifications, deletions: deletions),
+        syncEngine: syncEngine)
+    }
+
+    private func handleFetchedRecordZoneChangesAdmitted(
+      modifications: [CKRecord] = [],
+      deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)] = [],
+      syncEngine: any SyncEngineProtocol
+    ) async {
       let window = transfer(syncEngine)
       window?.state.withValue { $0.active += 1 }
       defer { window?.state.withValue { $0.active -= 1 } }
@@ -2434,9 +2487,11 @@
     }
 
     private func scheduleDurableRecordZoneFailureRetry(
-      _ failure: DurableRecordZoneFailure, accountGeneration: UUID? = nil
+      _ failure: DurableRecordZoneFailure, accountGeneration: UUID? = nil,
+      epoch: UUID? = nil, engine: (any SyncEngineProtocol)? = nil
     ) {
       guard !failure.isTerminal else { return }
+      let epoch = epoch ?? settlement.withAdmission { drainState.state.epoch }
       let exponent = min(max(failure.attemptCount - 1, 0), 5)
       let delay = min(30 * pow(2, Double(exponent)), 900)
       Task { [weak self] in
@@ -2446,8 +2501,9 @@
         } catch {
           return
         }
+        guard let self, self.beginDeferred(epoch: epoch, engine: engine) else { return }
+        defer { self.settlement.end() }
         guard
-          let self,
           let currentFailure = await self.durableRecordZoneFailure(
             recordID: failure.recordID,
             action: failure.action
@@ -2478,7 +2534,7 @@
       }
     }
 
-    private func scheduleDurableRecordZoneFailureRetries(accountGeneration: UUID) async {
+    private func scheduleDurableRecordZoneFailureRetries(accountGeneration: UUID, epoch: UUID) async {
       let failures =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await metadatabase.read { db in
@@ -2487,7 +2543,7 @@
         }
         ?? []
       for failure in failures {
-        scheduleDurableRecordZoneFailureRetry(failure, accountGeneration: accountGeneration)
+        scheduleDurableRecordZoneFailureRetry(failure, accountGeneration: accountGeneration, epoch: epoch)
       }
     }
 
@@ -2498,9 +2554,16 @@
       failedRecordDeletes: [CKRecord.ID: CKError] = [:],
       syncEngine: any SyncEngineProtocol
     ) async {
-      // Explicit retirement already preserved both the queued and consumed intent. Late SDK
-      // results must not mutate the replacement account or re-enqueue an obsolete snapshot.
-      guard !retirementUploads.isRetired(syncEngine) else { return }
+      await handleEvent(.sentRecordZoneChanges(savedRecords: savedRecords,
+        failedRecordSaves: failedRecordSaves, deletedRecordIDs: deletedRecordIDs,
+        failedRecordDeletes: failedRecordDeletes), syncEngine: syncEngine)
+    }
+
+    private func handleSentRecordZoneChangesAdmitted(
+      savedRecords: [CKRecord], failedRecordSaves: [(record: CKRecord, error: CKError)],
+      deletedRecordIDs: [CKRecord.ID], failedRecordDeletes: [CKRecord.ID: CKError],
+      syncEngine: any SyncEngineProtocol
+    ) async {
       var settledUploads = savedRecords.map {
         CKSyncEngine.PendingRecordZoneChange.saveRecord($0.recordID)
       } + deletedRecordIDs.map { .deleteRecord($0) }
@@ -2756,7 +2819,7 @@
 
         case .quotaExceeded, .limitExceeded:
           if let failure = await persistLocalSaveFailure(isTerminal: false) {
-            scheduleDurableRecordZoneFailureRetry(failure)
+            scheduleDurableRecordZoneFailureRetry(failure, engine: syncEngine)
           }
           await reportLocalSaveFailure(disposition: .transientPendingRetry)
 
@@ -2891,7 +2954,7 @@
         syncEngine.state.remove(pendingRecordZoneChanges: failedDeleteHandling.3)
         syncEngine.state.add(pendingRecordZoneChanges: failedDeleteHandling.2)
         for failure in failedDeleteHandling.4 {
-          scheduleDurableRecordZoneFailureRetry(failure)
+          scheduleDurableRecordZoneFailureRetry(failure, engine: syncEngine)
         }
       }
       for (recordID, error, disposition) in failedDeleteHandling?.1 ?? [] {
@@ -2909,7 +2972,7 @@
         )
       }
       if failedDeleteHandling?.0 == true {
-        await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
+        await handleFetchedRecordZoneChangesAdmitted(syncEngine: syncEngine)
       }
     }
 
@@ -3264,7 +3327,7 @@
   }
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-  package struct SyncEngines {
+  package struct SyncEngines: Sendable {
     fileprivate var activityCounts: [ObjectIdentifier: [SyncEngine.Activity: Int]] = [:]
     private let rawValue: (private: any SyncEngineProtocol, shared: any SyncEngineProtocol)?
     init() {
