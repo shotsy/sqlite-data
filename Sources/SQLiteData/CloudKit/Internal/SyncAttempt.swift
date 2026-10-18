@@ -196,6 +196,10 @@
         }
         let key = AutomaticKey(engine: id, upload: upload)
         let owners = state.attempts.values.filter { $0.engines.contains(id) }
+        // Retired callbacks still share the writer until stop/drain closes their admission.
+        for attempt in state.attempts.values where !attempt.engines.contains(id) {
+          attempt.state.withValue { $0.uncertain = true }
+        }
         if case .stateUpdate? = event {
           let automatic = state.automatic.filter { $0.key.engine == id }.map(\.value)
           if !owners.isEmpty || !automatic.isEmpty { return owners + automatic }

@@ -367,6 +367,26 @@
           delegate.failures.value.allSatisfy { $0.context.operationKind == .sentDatabaseChanges })
       }
 
+      @Test(arguments: [false, true])
+      func retiredCallbackDuringNewAttemptCannotCertifySuccess(failing: Bool) async throws {
+        let retired = syncEngine.private
+        syncEngine.stop()
+        try await syncEngine.start()
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .private else { return }
+          await self.syncEngine.handleEvent(
+            .didFetchRecordZoneChanges(
+              zoneID: CKRecordZone.ID(zoneName: "retired"),
+              error: failing ? CKError(.networkFailure) : nil),
+            syncEngine: retired)
+        } operation: {
+          let result = try await receipt(false)
+          #expect(result.result == .unconfirmed)
+          #expect(result.failures.isEmpty)
+        }
+        syncEngine.private.state.removePendingChanges()
+      }
+
       private func receipt(_ send: Bool) async throws -> SyncEngine.AttemptReceipt {
         if send { return try await syncEngine.sendChangesWithReceipt() }
         return try await syncEngine.fetchChangesWithReceipt()
