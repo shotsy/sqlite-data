@@ -1,6 +1,8 @@
 #if canImport(CloudKit)
   import CloudKit
   import ConcurrencyExtras
+  import Foundation
+  import GRDB
   @testable import SQLiteData
   import Testing
 
@@ -121,6 +123,144 @@
           _ = try await syncEngine.waitForSettlement()
           syncEngine.stop()
         }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: ["event", "account", "stop"])
+      func leaseExcludesConcurrentInvalidation(_ kind: String) async throws {
+        let token = try await syncEngine.waitForSettlement()
+        let engine = syncEngine.private
+        let entered = SettlementLatch()
+        let release = DispatchSemaphore(value: 0)
+        let attempted = DispatchSemaphore(value: 0)
+        let completed = DispatchSemaphore(value: 0)
+        let result = LockIsolated<Result<Int, any Error>?>(nil)
+        let leaseFinished = SettlementLatch()
+        // Use a real thread: other suites temporarily install the main serial executor globally.
+        DispatchQueue.global().async { [syncEngine] in
+          result.setValue(Result {
+            try syncEngine.withSettlementLease(token) {
+              entered.signal()
+              #expect(release.wait(timeout: .now() + 5) == .success)
+              return 42
+            }
+          })
+          leaseFinished.signal()
+        }
+        await entered.wait()
+        DispatchQueue.global().async {
+          #expect(attempted.wait(timeout: .now() + 5) == .success)
+          #expect(completed.wait(timeout: .now() + 0.05) == .timedOut)
+          release.signal()
+        }
+        let event = Task { [syncEngine] in
+          attempted.signal()
+          switch kind {
+          case "stop": syncEngine.stop()
+          case "account":
+            await syncEngine.handleEvent(
+              .accountChange(changeType: .signIn(currentUser: CKRecord.ID(recordName: "user"))),
+              syncEngine: engine
+            )
+          default:
+            await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
+          }
+          completed.signal()
+        }
+        await leaseFinished.wait()
+        #expect(try result.value?.get() == 42)
+        await event.value
+        #expect(!syncEngine.isValid(token))
+        if kind == "account" {
+          try await syncEngine.processPendingDatabaseChanges(scope: .private)
+        }
+        if kind == "event" {
+          // The blocked event was delivered, not discarded by the lease.
+          #expect(syncEngine.isFetchingChanges)
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
+          _ = try await syncEngine.waitForSettlement()
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: [false, true])
+      func leasePersistenceDoesNotBlockWriterBehindAdmission(stopping: Bool) async throws {
+        let token = try await syncEngine.waitForSettlement()
+        let engine = syncEngine.private
+        let writer = userDatabase.database
+        let writerEntered = DispatchSemaphore(value: 0)
+        let admissionAttempted = DispatchSemaphore(value: 0)
+        let leaseEntered = SettlementLatch()
+        let writerFinished = SettlementLatch()
+        let leaseFinished = SettlementLatch()
+        let startConsumer = DispatchSemaphore(value: 0)
+        // A genuine writer transaction runs the same synchronous trigger callback as a local edit.
+        DispatchQueue.global().async { [syncEngine] in
+          do {
+            try writer.write { _ in
+              writerEntered.signal()
+              #expect(admissionAttempted.wait(timeout: .now() + 5) == .success)
+              Thread.sleep(forTimeInterval: 0.05)
+              syncEngine.didUpdate(
+                recordName: "lease-test:remindersLists", zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName, oldZoneName: "zone",
+                oldOwnerName: CKCurrentUserDefaultName, descendantRecordNames: nil
+              )
+            }
+          } catch { Issue.record(error) }
+          writerFinished.signal()
+        }
+        DispatchQueue.global().async { [syncEngine] in
+          do {
+            try syncEngine.withSettlementLease(token) {
+              #expect(writerEntered.wait(timeout: .now() + 5) == .success)
+              leaseEntered.signal()
+              #expect(startConsumer.wait(timeout: .now() + 5) == .success)
+              try writer.write { db in
+                try db.execute(sql: "CREATE TABLE IF NOT EXISTS lease_receipt (id INTEGER)")
+                try db.execute(sql: "INSERT INTO lease_receipt VALUES (1)")
+              }
+            }
+          } catch { Issue.record(error) }
+          leaseFinished.signal()
+        }
+        await leaseEntered.wait()
+        let event = Task { [syncEngine] in
+          admissionAttempted.signal()
+          startConsumer.signal()
+          if stopping {
+            syncEngine.stop()
+          } else {
+            await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
+          }
+        }
+        await writerFinished.wait()
+        await leaseFinished.wait()
+        await event.value
+        #expect(try await writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM lease_receipt") } == 1)
+        engine.state.remove(pendingRecordZoneChanges: [
+          .saveRecord(CKRecord.ID(recordName: "lease-test:remindersLists", zoneID: CKRecordZone.ID(zoneName: "zone")))
+        ])
+        if !stopping {
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func throwingConsumerReleasesLeaseAndPropagatesError() async throws {
+        struct ConsumerFailure: Error, Equatable { let value: Int }
+        let token = try await syncEngine.waitForSettlement()
+        #expect(throws: ConsumerFailure(value: 42)) {
+          try syncEngine.withSettlementLease(token) { throw ConsumerFailure(value: 42) }
+        }
+        #expect(try syncEngine.withSettlementLease(token) { "retry" } == "retry")
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+        let invoked = LockIsolated(false)
+        #expect(throws: CancellationError.self) {
+          try syncEngine.withSettlementLease(token) { invoked.setValue(true) }
+        }
+        #expect(!invoked.value)
+        await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)

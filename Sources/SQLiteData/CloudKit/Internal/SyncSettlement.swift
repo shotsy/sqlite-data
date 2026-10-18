@@ -7,10 +7,10 @@
   extension SyncEngine {
     /// Evidence that both scopes finished their current fetch, application and awaited reports.
     ///
-    /// This is not a lease or evidence of success: errors and pending retries must be inspected
-    /// separately. New work (including automatic fetches), stop and restart invalidate it.
-    /// Validate with ``isValid(_:)`` after EVERY suspension before using it to finalize recovery.
-    /// Validation is only a point-in-time check, not an atomic transaction with application state.
+    /// This is not evidence of success: errors and pending retries must be inspected separately.
+    /// New work (including automatic fetches), stop and restart invalidate it. Use
+    /// ``withSettlementLease(_:consume:)`` to validate through synchronous consumption;
+    /// ``isValid(_:)`` alone is only a point-in-time check.
     public struct SettledToken: Sendable, Equatable {
       fileprivate let epoch: UUID
     }
@@ -39,6 +39,24 @@
       return try await settlement.wait(lifetime: lifetime)
     }
 
+    /// Validates a settled token and excludes new work through synchronous consumption.
+    ///
+    /// Throws `CancellationError` without invoking `consume` if the token is stale or stopped.
+    /// Otherwise returns the consumer's value or propagates its error unchanged. This does not
+    /// certify success or roll back the consumer's side effects, nor make a token single-use.
+    ///
+    /// Event admission, account changes and stop wait at the settlement lock until consumption
+    /// returns (including when it throws). Waiting events are processed afterward, never dropped
+    /// by the lease. Keep the consumer short and synchronous: never hold this lease across an
+    /// `await`, call sync-engine APIs, or wait for work that may call those APIs. The consumer may
+    /// synchronously persist application-owned state; it must not reenter synchronization.
+    public func withSettlementLease<Result: Sendable>(
+      _ token: SettledToken,
+      consume: @Sendable () throws -> Result
+    ) throws -> Result {
+      try settlement.withLease(token, consume: consume)
+    }
+
     /// Whether no new work has begun since this engine issued the token and it is still settled.
     public func isValid(_ token: SettledToken) -> Bool {
       settlement.isValid(token)
@@ -52,15 +70,18 @@
       let engine: ObjectIdentifier
       let activity: SyncEngine.Activity
     }
-    private struct State {
+    // Reference storage keeps the reentrancy guard visible through LockIsolated's recursive lock.
+    // All access, including the synchronous consumer, remains protected by `state`.
+    private final class State {
       var lifetime: UUID?
       var epoch = UUID()
       var active = 0
+      var consuming = false
       var activities: [Key: Int] = [:]
       var waiters: [UUID: CheckedContinuation<SyncEngine.SettledToken, any Error>] = [:]
       var isSettled: Bool { lifetime != nil && active == 0 && activities.isEmpty }
 
-      mutating func resumeIfSettled() {
+      func resumeIfSettled() {
         guard isSettled else { return }
         let token = SyncEngine.SettledToken(epoch: epoch)
         let continuations = waiters.values
@@ -70,8 +91,15 @@
     }
     private let state = LockIsolated(State())
 
+    // Lifecycle admission always takes this lock before the engine-identity lock. Never wait
+    // for a lease while holding a lock needed by synchronous database-trigger callbacks.
+    func withAdmission<Result: Sendable>(_ body: @Sendable () throws -> Result) rethrows -> Result {
+      try state.withValue { _ in try body() }
+    }
+
     func start() -> UUID {
       state.withValue {
+        precondition(!$0.consuming, "A settlement consumer must not reenter synchronization")
         let lifetime = UUID()
         $0.lifetime = lifetime
         $0.epoch = UUID()
@@ -81,6 +109,7 @@
 
     func stop() {
       state.withValue {
+        precondition(!$0.consuming, "A settlement consumer must not reenter synchronization")
         $0.lifetime = nil
         $0.epoch = UUID()
         $0.activities.removeAll()
@@ -93,6 +122,7 @@
 
     func begin() {
       state.withValue {
+        precondition(!$0.consuming, "A settlement consumer must not reenter synchronization")
         $0.epoch = UUID()
         $0.active += 1
       }
@@ -107,6 +137,7 @@
 
     func beginEvent(_ event: SyncEngine.Event, engine: any SyncEngineProtocol, isCurrent: Bool) {
       state.withValue {
+        precondition(!$0.consuming, "A settlement consumer must not reenter synchronization")
         $0.epoch = UUID()
         $0.active += 1
         guard isCurrent, let activity = activity(event, starting: true) else { return }
@@ -147,6 +178,19 @@
 
     func isValid(_ token: SyncEngine.SettledToken) -> Bool {
       state.withValue { $0.isSettled && $0.epoch == token.epoch }
+    }
+
+    func withLease<Result: Sendable>(
+      _ token: SyncEngine.SettledToken,
+      consume: @Sendable () throws -> Result
+    ) throws -> Result {
+      try state.withValue { state in
+        guard state.isSettled, state.epoch == token.epoch else { throw CancellationError() }
+        precondition(!state.consuming, "Settlement leases cannot be nested")
+        state.consuming = true
+        defer { state.consuming = false }
+        return try consume()
+      }
     }
 
     func wait(lifetime: UUID? = nil) async throws -> SyncEngine.SettledToken {
