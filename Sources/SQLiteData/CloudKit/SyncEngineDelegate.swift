@@ -8,10 +8,6 @@
   public enum SyncEngineOperation: String, Sendable, Equatable {
     /// An explicit fetch of remote changes threw an error.
     case fetchChanges = "fetchChanges"
-    /// An explicit send of local changes threw an error.
-    case sendChanges = "sendChanges"
-    /// CloudKit failed to save or delete a database zone.
-    case sentDatabaseChanges = "sentDatabaseChanges"
     /// A CloudKit record-zone download completed with an error.
     case fetchRecordZoneChanges = "didFetchRecordZoneChanges"
     /// A locally-changed record failed to save to CloudKit.
@@ -85,7 +81,9 @@
     }
 
     /// Creates context for a string operation, retaining compatibility with custom operations.
-    /// Known operation raw values also populate `operationKind`.
+    /// Known operation raw values also populate `operationKind`. New receipt operations
+    /// `sendChanges` and `sentDatabaseChanges` remain string-only so adding receipt support
+    /// does not break existing exhaustive switches over `SyncEngineOperation`.
     public init(
       operation: String,
       tableName: String? = nil,

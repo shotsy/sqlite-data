@@ -893,7 +893,7 @@
           recordAttemptFailure(
             error,
             context: SyncEngineErrorContext(
-              operation: .sendChanges, databaseScope: engine.database.databaseScope)
+              operation: "sendChanges", databaseScope: engine.database.databaseScope)
           )
           await finishTransfer(engine, upload: true, explicit: true)
           throw error
@@ -1399,7 +1399,7 @@
           recordAttemptFailure(
             error,
             context: SyncEngineErrorContext(
-              operation: .sentDatabaseChanges, databaseScope: syncEngine.database.databaseScope,
+              operation: "sentDatabaseChanges", databaseScope: syncEngine.database.databaseScope,
               zoneID: zoneID))
         }
       case .fetchedRecordZoneChanges(let modifications, let deletions):
