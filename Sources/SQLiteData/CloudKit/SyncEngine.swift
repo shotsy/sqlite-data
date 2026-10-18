@@ -40,6 +40,10 @@
     // on the user writer; validation and mutations must share that same writer turn.
     // Never acquire settlement from the writer: a lease consumer can be waiting on it.
     private let accountGeneration = LockIsolated(UUID())
+    private enum AccountResetState { case ready, resetting, failed }
+    // Admission is serialized with startup installation by settlement, never from a writer.
+    // A failed reset keeps startup closed until deleteLocalData successfully retries cleanup.
+    private let accountResetState = LockIsolated(AccountResetState.ready)
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -546,6 +550,9 @@
     /// last time it synchronized.
     ///
     /// > Note: By default, sync engines start syncing when initialized.
+    ///
+    /// Throws `CancellationError` while an account reset is in progress, or after a reset
+    /// failed. Retry ``deleteLocalData()`` to complete a failed reset before starting.
     public func start() async throws {
       try await start().value
     }
@@ -622,26 +629,27 @@
     }
 
     private func start() throws -> Task<Void, Never> {
-      // Capture at origination, before any cached schema or record can be read.
-      let accountGeneration = self.accountGeneration.value
-      guard !isRunning else { return Task {} }
-      let lifetime: UUID? = observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        settlement.withAdmission {
-          syncEngines.withValue {
-            guard !$0.isRunning else { return nil }
-            settlement.begin()
-            let lifetime = settlement.start()
-            let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
-            $0 = SyncEngines(
-              private: privateSyncEngine,
-              shared: sharedSyncEngine
-            )
-            retirementUploads.register($0)
-            return lifetime
+      // Capture and install atomically with reset admission, before reading cached data.
+      // A generation alone is insufficient while reset still contains old-account rows.
+      let ownership: (lifetime: UUID, generation: UUID)? =
+        try observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
+          try settlement.withAdmission {
+            guard accountResetState.value == .ready else { throw CancellationError() }
+            return syncEngines.withValue {
+              guard !$0.isRunning else { return nil }
+              settlement.begin()
+              let lifetime = settlement.start()
+              let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
+              $0 = SyncEngines(
+                private: privateSyncEngine,
+                shared: sharedSyncEngine
+              )
+              retirementUploads.register($0)
+              return (lifetime, accountGeneration.value)
+            }
           }
         }
-      }
-      guard let lifetime else { return Task {} }
+      guard let (lifetime, accountGeneration) = ownership else { return Task {} }
       var handedOff = false
       defer { if !handedOff { settlement.end() } }
 
@@ -1085,6 +1093,8 @@
       }
     }
 
+    // Standalone teardown/setup is also used by stopped-engine schema maintenance.
+    // Public account-reset admission spans this operation AND local cleanup below.
     package func tearDownSyncEngine() throws {
       try userDatabase.write { db in
         accountGeneration.setValue(UUID())
@@ -1094,7 +1104,7 @@
             .dropTriggers(defaultZone: defaultZone, privateTables: privateTables, db: db)
         }
         for trigger in SyncMetadata.callbackTriggers(for: self).reversed() {
-          try trigger.drop().execute(db)
+          try trigger.drop(ifExists: true).execute(db)
         }
       }
       try metadatabase.erase()
@@ -1110,24 +1120,37 @@
     ///
     /// > Important: It is only appropriate to call this method when the device's iCloud account
     /// > logs out or changes.
+    ///
+    /// Concurrent resets throw `CancellationError`. If cleanup fails, the error is rethrown
+    /// and startup remains disabled until a subsequent call successfully completes cleanup.
     public func deleteLocalData() async throws {
-      settlement.begin()
-      defer { settlement.end() }
+      try settlement.withAdmission {
+        guard accountResetState.value != .resetting else { throw CancellationError() }
+        accountResetState.setValue(.resetting)
+        settlement.begin()
+      }
+      var cleanedUp = false
+      defer {
+        if !cleanedUp {
+          settlement.withAdmission { accountResetState.setValue(.failed) }
+        }
+        settlement.end()
+      }
       stop()
       try tearDownSyncEngine()
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          for table in tables {
-            func open<T>(_: some SynchronizableTable<T>) {
-              withErrorReporting(.sqliteDataCloudKitFailure) {
-                try T.delete().execute(db)
-              }
-            }
-            open(table)
+      try await userDatabase.write { db in
+        for table in tables.reversed() {
+          func open<T>(_: some SynchronizableTable<T>) throws {
+            try T.delete().execute(db)
           }
-          try setUpSyncEngine(writableDB: db)
+          try open(table)
         }
+        try setUpSyncEngine(writableDB: db)
       }
+      // Only publish startup admission after both metadata and user data are clean and
+      // triggers are reinstalled. A concurrent start from here sees only the new account.
+      settlement.withAdmission { accountResetState.setValue(.ready) }
+      cleanedUp = true
       try await start()
     }
 
@@ -1362,7 +1385,7 @@
         privateTables: privateTables
       )
       .reversed() {
-        try trigger.drop().execute(db)
+        try trigger.drop(ifExists: true).execute(db)
       }
     }
   }

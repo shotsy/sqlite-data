@@ -3,6 +3,7 @@
   import ConcurrencyExtras
   import Dependencies
   import Foundation
+  import GRDB
   @testable import SQLiteData
   import Testing
 
@@ -10,6 +11,80 @@
     @MainActor
     @Suite(.serialized)
     final class StartupAccountOwnershipTests: BaseCloudKitTests, @unchecked Sendable {
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func startIsRejectedThroughoutReset() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Old account") }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let gate = ResetTeardownGate()
+        try await userDatabase.write { db in
+          db.trace { event in
+            // Generation has advanced, but metadata and user rows are still old.
+            if event.description.uppercased().hasPrefix("DROP TRIGGER") { gate.blockOnce() }
+          }
+        }
+        let engine = syncEngine
+        let reset = withEscapedDependencies { dependencies in
+          Task.detached {
+            try await dependencies.yield { try await engine.deleteLocalData() }
+          }
+        }
+        defer { gate.open() }
+        for await _ in gate.entered { break }
+        // A watchdog only prevents a broken admission guard from hanging the suite.
+        // The SQL trace, not this timer, determines the interleaving.
+        let watchdog = Task.detached {
+          try await Task.sleep(for: .seconds(2))
+          gate.open()
+        }
+        defer { watchdog.cancel() }
+        await #expect(throws: CancellationError.self) { try await engine.start() }
+        await #expect(throws: CancellationError.self) { try await engine.deleteLocalData() }
+        #expect(!engine.isRunning)
+        gate.open()
+        try await reset.value
+        try await userDatabase.write { db in db.trace(options: []) }
+        try await userDatabase.read { db in
+          try #expect(RemindersList.count().fetchOne(db) == 0)
+        }
+        try await engine.metadatabase.read { db in
+          try #expect(SyncMetadata.count().fetchOne(db) == 0)
+          try #expect(PendingRecordZoneChange.count().fetchOne(db) == 0)
+        }
+        engine.private.state.assertPendingRecordZoneChanges([])
+        try await engine.processPendingDatabaseChanges(scope: .private)
+        engine.stop()
+        try await engine.start()
+        #expect(engine.isRunning)
+        try await engine.processPendingDatabaseChanges(scope: .private)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func failedCleanupKeepsStartupClosedUntilRetry() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Old account") }
+          try db.execute(sql: """
+            CREATE TEMP TRIGGER fail_account_cleanup BEFORE DELETE ON remindersLists
+            BEGIN SELECT RAISE(ABORT, 'account cleanup failure'); END
+            """)
+        }
+        await #expect(throws: DatabaseError.self) { try await syncEngine.deleteLocalData() }
+        #expect(!syncEngine.isRunning)
+        await #expect(throws: CancellationError.self) { try await syncEngine.start() }
+        try await userDatabase.write { db in
+          try #expect(RemindersList.count().fetchOne(db) == 1)
+          try db.execute(sql: "DROP TRIGGER fail_account_cleanup")
+        }
+        try await syncEngine.deleteLocalData()
+        #expect(syncEngine.isRunning)
+        try await userDatabase.read { db in
+          try #expect(RemindersList.count().fetchOne(db) == 0)
+        }
+        syncEngine.private.state.assertPendingRecordZoneChanges([])
+        try await syncEngine.processPendingDatabaseChanges(scope: .private)
+      }
+
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test(arguments: [false, true])
       func cachedSchemaRepairAcrossReset(reset: Bool) async throws {
@@ -116,6 +191,26 @@
         }
       }
     }
+  }
+
+  private final class ResetTeardownGate: Sendable {
+    let entered: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let blocked = LockIsolated(false)
+
+    init() { (entered, continuation) = AsyncStream.makeStream() }
+    func blockOnce() {
+      let first = blocked.withValue { blocked in
+        guard !blocked else { return false }
+        blocked = true
+        return true
+      }
+      guard first else { return }
+      continuation.yield(())
+      semaphore.wait()
+    }
+    func open() { semaphore.signal() }
   }
 
   @Table("remindersLists")
