@@ -593,10 +593,12 @@
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         observationRegistrar.withMutation(of: self, keyPath: \.isSendingChanges) {
           observationRegistrar.withMutation(of: self, keyPath: \.isFetchingChanges) {
-            syncEngines.withValue {
-              settlement.stop()
-              transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
-              $0 = SyncEngines()
+            settlement.withAdmission {
+              syncEngines.withValue {
+                settlement.stop()
+                transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
+                $0 = SyncEngines()
+              }
             }
           }
         }
@@ -614,16 +616,18 @@
     private func start() throws -> Task<Void, Never> {
       guard !isRunning else { return Task {} }
       let lifetime: UUID? = observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          guard !$0.isRunning else { return nil }
-          settlement.begin()
-          let lifetime = settlement.start()
-          let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
-          $0 = SyncEngines(
-            private: privateSyncEngine,
-            shared: sharedSyncEngine
-          )
-          return lifetime
+        settlement.withAdmission {
+          syncEngines.withValue {
+            guard !$0.isRunning else { return nil }
+            settlement.begin()
+            let lifetime = settlement.start()
+            let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
+            $0 = SyncEngines(
+              private: privateSyncEngine,
+              shared: sharedSyncEngine
+            )
+            return lifetime
+          }
         }
       }
       guard let lifetime else { return Task {} }
@@ -716,14 +720,16 @@
         }
       }
       handedOff = true
-      syncEngines.withValue { _ in
-        guard (try? settlement.currentLifetime()) == lifetime else {
-          startTask.cancel()
-          return
-        }
-        self.startTask.withValue {
-          $0?.cancel()
-          $0 = startTask
+      settlement.withAdmission {
+        syncEngines.withValue { _ in
+          guard (try? settlement.currentLifetime()) == lifetime else {
+            startTask.cancel()
+            return
+          }
+          self.startTask.withValue {
+            $0?.cancel()
+            $0 = startTask
+          }
         }
       }
       return startTask
@@ -1304,11 +1310,13 @@
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
       // Register before any actor hop, atomically with engine retirement. The final did-fetch
       // event owns its lifecycle count until application and all awaited reports return.
-      syncEngines.withValue {
-        settlement.beginEvent(
-          event, engine: syncEngine,
-          isCurrent: $0.private === syncEngine || $0.shared === syncEngine
-        )
+      settlement.withAdmission {
+        syncEngines.withValue {
+          settlement.beginEvent(
+            event, engine: syncEngine,
+            isCurrent: $0.private === syncEngine || $0.shared === syncEngine
+          )
+        }
       }
       defer { settlement.endEvent(event, engine: syncEngine) }
       // A racing final boundary cannot certify work still applying or reporting an error.

@@ -2,6 +2,7 @@
   import CloudKit
   import ConcurrencyExtras
   import Foundation
+  import GRDB
   @testable import SQLiteData
   import Testing
 
@@ -178,6 +179,70 @@
           #expect(syncEngine.isFetchingChanges)
           await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
           _ = try await syncEngine.waitForSettlement()
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: [false, true])
+      func leasePersistenceDoesNotBlockWriterBehindAdmission(stopping: Bool) async throws {
+        let token = try await syncEngine.waitForSettlement()
+        let engine = syncEngine.private
+        let writer = userDatabase.database
+        let writerEntered = DispatchSemaphore(value: 0)
+        let admissionAttempted = DispatchSemaphore(value: 0)
+        let leaseEntered = SettlementLatch()
+        let writerFinished = SettlementLatch()
+        let leaseFinished = SettlementLatch()
+        let startConsumer = DispatchSemaphore(value: 0)
+        // A genuine writer transaction runs the same synchronous trigger callback as a local edit.
+        DispatchQueue.global().async { [syncEngine] in
+          do {
+            try writer.write { _ in
+              writerEntered.signal()
+              #expect(admissionAttempted.wait(timeout: .now() + 5) == .success)
+              Thread.sleep(forTimeInterval: 0.05)
+              syncEngine.didUpdate(
+                recordName: "lease-test:remindersLists", zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName, oldZoneName: "zone",
+                oldOwnerName: CKCurrentUserDefaultName, descendantRecordNames: nil
+              )
+            }
+          } catch { Issue.record(error) }
+          writerFinished.signal()
+        }
+        DispatchQueue.global().async { [syncEngine] in
+          do {
+            try syncEngine.withSettlementLease(token) {
+              #expect(writerEntered.wait(timeout: .now() + 5) == .success)
+              leaseEntered.signal()
+              #expect(startConsumer.wait(timeout: .now() + 5) == .success)
+              try writer.write { db in
+                try db.execute(sql: "CREATE TABLE IF NOT EXISTS lease_receipt (id INTEGER)")
+                try db.execute(sql: "INSERT INTO lease_receipt VALUES (1)")
+              }
+            }
+          } catch { Issue.record(error) }
+          leaseFinished.signal()
+        }
+        await leaseEntered.wait()
+        let event = Task { [syncEngine] in
+          admissionAttempted.signal()
+          startConsumer.signal()
+          if stopping {
+            syncEngine.stop()
+          } else {
+            await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
+          }
+        }
+        await writerFinished.wait()
+        await leaseFinished.wait()
+        await event.value
+        #expect(try await writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM lease_receipt") } == 1)
+        engine.state.remove(pendingRecordZoneChanges: [
+          .saveRecord(CKRecord.ID(recordName: "lease-test:remindersLists", zoneID: CKRecordZone.ID(zoneName: "zone")))
+        ])
+        if !stopping {
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
         }
       }
 

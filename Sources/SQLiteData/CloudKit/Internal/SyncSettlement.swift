@@ -91,6 +91,12 @@
     }
     private let state = LockIsolated(State())
 
+    // Lifecycle admission always takes this lock before the engine-identity lock. Never wait
+    // for a lease while holding a lock needed by synchronous database-trigger callbacks.
+    func withAdmission<Result: Sendable>(_ body: @Sendable () throws -> Result) rethrows -> Result {
+      try state.withValue { _ in try body() }
+    }
+
     func start() -> UUID {
       state.withValue {
         precondition(!$0.consuming, "A settlement consumer must not reenter synchronization")
