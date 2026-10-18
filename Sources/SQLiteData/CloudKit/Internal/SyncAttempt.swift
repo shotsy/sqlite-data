@@ -38,7 +38,9 @@
     public func fetchChangesWithReceipt(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
     ) async throws -> AttemptReceipt {
-      try await runAttempt(receipt: true) { try await self.performFetchChanges(options) }!
+      try await runAttempt(receipt: true) { work in
+        try await self.performFetchChanges(options, work: work)
+      }!
     }
 
     /// Sends and returns a settled receipt with the same attribution and cancellation rules as
@@ -47,30 +49,34 @@
     public func sendChangesWithReceipt(
       _ options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws -> AttemptReceipt {
-      try await runAttempt(receipt: true) { try await self.performSendChanges(options) }!
+      try await runAttempt(receipt: true) { work in
+        try await self.performSendChanges(options, work: work)
+      }!
     }
 
     @TaskLocal static var attemptOwners: [SyncAttempt] = []
 
     func runAttempt(
-      receipt: Bool, operation: @Sendable () async throws -> Void
+      receipt: Bool, lifetime expectedLifetime: UUID? = nil,
+      operation: @Sendable (Work) async throws -> Void
     ) async throws -> AttemptReceipt? {
-      let (lifetime, attempt) = try settlement.withAdmission {
-        let lifetime = receipt ? try settlement.currentLifetime() : nil
+      let (work, attempt) = try settlement.withAdmission {
         let busy = settlement.hasWork
+        guard let work = admit(lifetime: expectedLifetime) else { throw CancellationError() }
         let attempt = attempts.begin(
-          engines: syncEngines.withValue { [$0.private, $0.shared].compactMap { $0 } })
+          engines: [work.engines.private, work.engines.shared].compactMap { $0 })
         if busy { attempt.state.withValue { $0.uncertain = true } }
-        settlement.begin()
-        return (lifetime, attempt)
+        return (work, attempt)
       }
+      let lifetime = work.lifetime
       defer { attempts.remove(attempt) }
       var operationError: (any Error)?
       await Self.$attemptOwners.withValue([attempt]) {
-        do { try await operation() } catch { operationError = error }
+        do { try await operation(work) } catch { operationError = error }
+        await deliverAttemptFailures([attempt])
       }
-      await deliverAttemptFailures([attempt])
-      settlement.end()
+      // Receipt settlement must not wait on this operation's own drain permit.
+      finish(work)
       if !receipt {
         if let operationError { throw operationError }
         return nil

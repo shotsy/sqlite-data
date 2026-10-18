@@ -413,7 +413,6 @@
       @Test func retiredEngineDoesNotFinishReplacementWindow() async throws {
         let delegate = try recorder()
         let oldEngine = syncEngine.private
-        let original = delegate.context.value
         await syncEngine.handleEvent(.willFetchChanges, syncEngine: oldEngine)
         syncEngine.stop()
         delegate.context.setValue(Self.context())
@@ -421,11 +420,10 @@
         #expect(syncEngine.private !== oldEngine)
         await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
         await syncEngine.handleEvent(.didFetchChanges, syncEngine: oldEngine)
-        #expect(delegate.outcomes.value.count == 1)
-        #expect(delegate.outcomes.value.first?.result == .interrupted)
-        #expect(delegate.outcomes.value.first?.context == original)
+        // The retired callback is rejected, including delegate delivery.
+        #expect(delegate.outcomes.value.isEmpty)
         await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
-        #expect(delegate.outcomes.value.count == 2)
+        #expect(delegate.outcomes.value.count == 1)
         #expect(delegate.outcomes.value.last?.result == .completed)
         #expect(delegate.outcomes.value.last?.context == delegate.context.value)
         syncEngine.stop()

@@ -77,11 +77,19 @@
       var epoch = UUID()
       var active = 0
       var consuming = false
+      var drains = 0
+      var stopRevision = UUID()
+      var drainWaiters: [CheckedContinuation<Void, Never>] = []
       var activities: [Key: Int] = [:]
       var waiters: [UUID: CheckedContinuation<SyncEngine.SettledToken, any Error>] = [:]
       var isSettled: Bool { lifetime != nil && active == 0 && activities.isEmpty }
 
       func resumeIfSettled() {
+        if active == 0 {
+          let continuations = drainWaiters
+          drainWaiters.removeAll()
+          for continuation in continuations { continuation.resume() }
+        }
         guard isSettled else { return }
         let token = SyncEngine.SettledToken(epoch: epoch)
         let continuations = waiters.values
@@ -107,8 +115,25 @@
       }
     }
 
-    func stop() {
+    var stopRevision: UUID { state.withValue { $0.stopRevision } }
+    var isDraining: Bool { state.withValue { $0.drains > 0 } }
+
+    func beginDrain() { state.withValue { $0.drains += 1 } }
+    func endDrain() { state.withValue { $0.drains -= 1 } }
+
+    // Cancellation must not weaken the barrier.
+    func drain() async {
+      await withCheckedContinuation { continuation in
+        state.withValue {
+          $0.drainWaiters.append(continuation)
+          $0.resumeIfSettled()
+        }
+      }
+    }
+
+    func stop(external: Bool = true) {
       state.withValue {
+        if external { $0.stopRevision = UUID() }
         precondition(!$0.consuming, "A settlement consumer must not reenter synchronization")
         $0.lifetime = nil
         $0.epoch = UUID()

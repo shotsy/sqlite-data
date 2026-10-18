@@ -367,24 +367,139 @@
           delegate.failures.value.allSatisfy { $0.context.operationKind == .sentDatabaseChanges })
       }
 
+      @Test($syncEngineDelegate.set(ReceiptFailureDelegate()))
+      func drainWaitsForExplicitFailureDelivery() async throws {
+        let send = true
+        let delegate = try #require(syncEngineDelegate as? ReceiptFailureDelegate)
+        try await scripted { engine, _ in
+          if engine.database.databaseScope == .private { throw CKError(.networkFailure) }
+        } operation: {
+          let attempt = Task { try await receipt(send) }
+          await delegate.entered.wait()
+          let drained = LockIsolated(false)
+          let drain = Task {
+            await syncEngine.stopAndDrain()
+            drained.setValue(true)
+          }
+          while syncEngine.isRunning { await Task.yield() }
+          #expect(!drained.value)
+          await #expect(throws: CancellationError.self) { try await receipt(send) }
+          delegate.release.signal()
+          await #expect(throws: CancellationError.self) { try await attempt.value }
+          await drain.value
+          #expect(drained.value)
+          #expect(delegate.failures.value.count == 1)
+        }
+        syncEngine.stop()
+      }
+
+      @Test($syncEngineDelegate.set(ReceiptFailureDelegate()))
+      func drainWaitsForDirectFailureDelivery() async throws {
+        let delegate = try #require(syncEngineDelegate as? ReceiptFailureDelegate)
+        let engine = syncEngine.private
+        let recordID = RemindersList.recordID(for: 999)
+        let callback = Task {
+          await syncEngine.handleSentRecordZoneChanges(
+            failedRecordDeletes: [recordID: CKError(.unknownItem)], syncEngine: engine)
+        }
+        await delegate.entered.wait()
+        let drained = LockIsolated(false)
+        let drain = Task {
+          await syncEngine.stopAndDrain()
+          drained.setValue(true)
+        }
+        while syncEngine.isRunning { await Task.yield() }
+        #expect(!drained.value)
+        delegate.release.signal()
+        await callback.value
+        await drain.value
+        #expect(drained.value)
+        #expect(delegate.failures.value.count == 1)
+      }
+
+      @Test
+      func lateProviderCannotMutateRetiredQueue() async throws {
+        let entered = ReceiptLatch()
+        let release = ReceiptLatch()
+        let recordID = RemindersList.recordID(for: 999)
+        await scripted({ _, _ in }, beforeProvider: {
+          entered.signal()
+          await release.wait()
+        }) {
+          let engine = syncEngine.syncEngines.withValue { $0.private! }
+          engine.state.add(pendingRecordZoneChanges: [.saveRecord(recordID)])
+          let batch = Task { await syncEngine.nextRecordZoneChangeBatch(syncEngine: engine) }
+          await entered.wait()
+          let drained = LockIsolated(false)
+          let drain = Task {
+            await syncEngine.stopAndDrain()
+            drained.setValue(true)
+          }
+          while syncEngine.isRunning { await Task.yield() }
+          #expect(!drained.value)
+          release.signal()
+          #expect(await batch.value?.recordsToSave.isEmpty == true)
+          await drain.value
+          // A provider admitted after stop would remove this missing record from the queue.
+          #expect(engine.state.pendingRecordZoneChanges == [.saveRecord(recordID)])
+          engine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
+        }
+        syncEngine.stop()
+      }
+
+      @Test($syncEngineDelegate.set(ReceiptFailureDelegate(blockFirst: false)))
+      func compositeKeepsOriginAndDeliversFailure() async throws {
+        let delegate = try #require(syncEngineDelegate as? ReceiptFailureDelegate)
+        let fetches = LockIsolated(0)
+        try await scripted { engine, sending in
+          if sending && engine.database.databaseScope == .private {
+            throw CKError(.networkFailure)
+          }
+          if !sending { fetches.withValue { $0 += 1 } }
+        } operation: {
+          await #expect(throws: CKError.self) { try await syncEngine.syncChanges() }
+          #expect(fetches.value == 0)
+          #expect(delegate.failures.value.count == 1)
+          #expect(delegate.failures.value.first?.context.operationKind == .sendChanges)
+        }
+      }
+
+      // Receipt-only behavior was unconfirmed; drain admission now rejects the retired
+      // callback entirely, so neither a successful nor failing retired event contaminates it.
       @Test(arguments: [false, true])
-      func retiredCallbackDuringNewAttemptCannotCertifySuccess(failing: Bool) async throws {
+      func retiredCallbackDuringNewAttemptIsRejected(failing: Bool) async throws {
         let retired = syncEngine.private
         syncEngine.stop()
         try await syncEngine.start()
+        try await syncEngine.processPendingDatabaseChanges(scope: .private)
         try await scripted { engine, _ in
           guard engine.database.databaseScope == .private else { return }
-          await self.syncEngine.handleEvent(
+          await engine.base.parentSyncEngine.handleEvent(
             .didFetchRecordZoneChanges(
               zoneID: CKRecordZone.ID(zoneName: "retired"),
               error: failing ? CKError(.networkFailure) : nil),
             syncEngine: retired)
         } operation: {
           let result = try await receipt(false)
-          #expect(result.result == .unconfirmed)
+          #expect(result.result == .succeeded)
           #expect(result.failures.isEmpty)
         }
-        syncEngine.private.state.removePendingChanges()
+      }
+
+      @Test
+      func compositeCannotFetchReplacementEngines() async throws {
+        let fetched = LockIsolated(false)
+        try await scripted { engine, sending in
+          if sending && engine.database.databaseScope == .private {
+            engine.base.parentSyncEngine.stop()
+            try await engine.base.parentSyncEngine.start()
+          }
+          if !sending { fetched.setValue(true) }
+        } operation: {
+          await #expect(throws: CancellationError.self) { try await syncEngine.syncChanges() }
+          #expect(!fetched.value)
+        }
+        syncEngine.stop()
       }
 
       private func receipt(_ send: Bool) async throws -> SyncEngine.AttemptReceipt {
@@ -394,13 +509,16 @@
 
       private func scripted(
         _ action: @escaping ReceiptEngine.Action,
+        beforeProvider: @escaping @Sendable () async -> Void = {},
         operation: () async throws -> Void
       ) async rethrows {
         let original = syncEngine.syncEngines.withValue { engines in
           let original = engines
           engines = SyncEngines(
-            private: ReceiptEngine(base: engines.private as! MockSyncEngine, action: action),
-            shared: ReceiptEngine(base: engines.shared as! MockSyncEngine, action: action))
+            private: ReceiptEngine(
+              base: engines.private as! MockSyncEngine, action: action, beforeProvider: beforeProvider),
+            shared: ReceiptEngine(
+              base: engines.shared as! MockSyncEngine, action: action, beforeProvider: beforeProvider))
           return original
         }
         defer { syncEngine.syncEngines.withValue { engines in engines = original } }
@@ -414,11 +532,16 @@
     typealias Action = @Sendable (ReceiptEngine, Bool) async throws -> Void
     let base: MockSyncEngine
     let action: Action
+    let beforeProvider: @Sendable () async -> Void
     var database: MockCloudDatabase { base.database }
     var state: MockSyncEngineState { base.state }
-    init(base: MockSyncEngine, action: @escaping Action) {
+    init(
+      base: MockSyncEngine, action: @escaping Action,
+      beforeProvider: @escaping @Sendable () async -> Void
+    ) {
       self.base = base
       self.action = action
+      self.beforeProvider = beforeProvider
     }
     func fetchChanges(_ options: CKSyncEngine.FetchChangesOptions) async throws {
       try await action(self, false)
@@ -434,7 +557,8 @@
       pendingChanges: [CKSyncEngine.PendingRecordZoneChange],
       recordProvider: @Sendable (CKRecord.ID) async -> CKRecord?
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
-      await base.recordZoneChangeBatch(
+      await beforeProvider()
+      return await base.recordZoneChangeBatch(
         pendingChanges: pendingChanges, recordProvider: recordProvider)
     }
   }

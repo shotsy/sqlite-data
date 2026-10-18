@@ -250,7 +250,8 @@
         #expect(reportedError.context.operationKind == .fetchedRecordApplication)
         #expect(reportedError.context.disposition == .terminalDroppedOrReconciled)
         #expect(reportedError.context.recordType == RemindersList.tableName)
-        #expect(String(describing: reportedError.error).contains("blocked fetched record application"))
+        #expect(
+          String(describing: reportedError.error).contains("blocked fetched record application"))
         try await userDatabase.read { db in
           try #expect(RemindersList.find(1).fetchOne(db)?.title == "Local")
         }
@@ -750,6 +751,9 @@
         await Task.yield()
         await testClock.advance(by: .seconds(30))
         await Task.yield()
+        // The retry is admitted before its asynchronous durable-failure read. Wait for that
+        // work instead of assuming a single executor yield also completes the database hop.
+        _ = try await syncEngine.waitForSettlement()
         try await syncEngine.processPendingRecordZoneChanges(scope: .private)
 
         let serverRecord = try syncEngine.private.database.record(
@@ -782,7 +786,8 @@
           ]
         )
 
-        await syncEngine.handleEvent(.willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: engine)
+        await syncEngine.handleEvent(
+          .willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: engine)
         #expect(syncEngine.isFetchingChanges)
         await syncEngine.handleEvent(
           .didFetchRecordZoneChanges(zoneID: zoneID, error: error), syncEngine: engine
@@ -793,7 +798,8 @@
         let report = try #require(reports.first)
         #expect((report.error as NSError).isEqual(error as NSError))
         #expect((report.error as NSError).userInfo[CKErrorRetryAfterKey] as? Int == 17)
-        let partialErrors = (report.error as NSError).userInfo[CKPartialErrorsByItemIDKey]
+        let partialErrors =
+          (report.error as NSError).userInfo[CKPartialErrorsByItemIDKey]
           as? [CKRecord.ID: CKError]
         #expect(partialErrors?[recordID]?.code == .networkUnavailable)
         #expect(report.context.operationKind == .fetchRecordZoneChanges)
@@ -817,7 +823,8 @@
         let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
         let engine = syncEngine.syncEngine(for: scope)
         let zoneID = CKRecordZone.ID(zoneName: "successful-fetch")
-        await syncEngine.handleEvent(.willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: engine)
+        await syncEngine.handleEvent(
+          .willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: engine)
         await syncEngine.handleEvent(
           .didFetchRecordZoneChanges(zoneID: zoneID, error: nil), syncEngine: engine
         )
@@ -830,7 +837,8 @@
         let delegate = try #require(syncEngineDelegate as? SuspendedFetchErrorDelegate)
         let engine = syncEngine.private
         let zoneID = CKRecordZone.ID(zoneName: "suspended-fetch")
-        await syncEngine.handleEvent(.willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: engine)
+        await syncEngine.handleEvent(
+          .willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: engine)
         let finished = LockIsolated(false)
         let event = Task {
           await syncEngine.handleEvent(
@@ -856,7 +864,8 @@
         scope: CKDatabase.Scope, cancellation: Bool
       ) async throws {
         let delegate = try #require(syncEngineDelegate as? ErrorReportingDelegate)
-        let original: any Error = cancellation
+        let original: any Error =
+          cancellation
           ? CancellationError()
           : NSError(domain: "fetch-test", code: 42, userInfo: ["detail": "original"])
         let fetch: FetchErrorSyncEngine.Fetch = { engine, _ in
@@ -996,7 +1005,8 @@
         let zoneID = CKRecordZone.ID(zoneName: "deduplicated-fetch")
         let eventError = CKError(.networkFailure, userInfo: [CKErrorRetryAfterKey: 12])
         // Independently constructed equal NSError values must deduplicate, not just identity.
-        let thrownError = wrapsEventError
+        let thrownError =
+          wrapsEventError
           ? NSError(domain: "wrapper", code: 1, userInfo: [NSUnderlyingErrorKey: eventError])
           : NSError(
             domain: CKErrorDomain, code: CKError.networkFailure.rawValue,
@@ -1006,7 +1016,10 @@
         let attempts = LockIsolated(0)
         let fetch: FetchErrorSyncEngine.Fetch = { engine, _ in
           guard engine.database.databaseScope == scope else { return }
-          let attempt = attempts.withValue { $0 += 1; return $0 }
+          let attempt = attempts.withValue {
+            $0 += 1
+            return $0
+          }
           if attempt == 1 {
             await engine.emit(.didFetchRecordZoneChanges(zoneID: zoneID, error: eventError))
           }
@@ -1100,13 +1113,14 @@
         try await withMainSerialExecutor {
           try await withFetchErrorEngines(
             privateFetch: { engine, _ in
-              eventTask.setValue(Task {
-                await engine.emit(
-                  .didFetchRecordZoneChanges(
-                    zoneID: CKRecordZone.ID(zoneName: "racing-fetch"), error: error
+              eventTask.setValue(
+                Task {
+                  await engine.emit(
+                    .didFetchRecordZoneChanges(
+                      zoneID: CKRecordZone.ID(zoneName: "racing-fetch"), error: error
+                    )
                   )
-                )
-              })
+                })
               await delegate.entered.wait()
               throwing.signal()
               throw error
@@ -1320,7 +1334,8 @@
       pendingChanges: [CKSyncEngine.PendingRecordZoneChange],
       recordProvider: @Sendable (CKRecord.ID) async -> CKRecord?
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
-      await base.recordZoneChangeBatch(pendingChanges: pendingChanges, recordProvider: recordProvider)
+      await base.recordZoneChangeBatch(
+        pendingChanges: pendingChanges, recordProvider: recordProvider)
     }
   }
 

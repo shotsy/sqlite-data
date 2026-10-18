@@ -5,9 +5,11 @@
   import GRDB
   @testable import SQLiteData
   import Testing
+  import TestLocals
 
   extension BaseCloudKitTests {
     @MainActor
+    @Suite(.serialized)
     final class SyncSettlementTests: BaseCloudKitTests, @unchecked Sendable {
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test(arguments: [CKDatabase.Scope.private, .shared])
@@ -119,14 +121,14 @@
           // Retired lifecycle notifications do not strand the new engine's waiters.
           await syncEngine.handleEvent(.willFetchChanges, syncEngine: oldEngine)
           await syncEngine.handleEvent(.didFetchChanges, syncEngine: oldEngine)
-          #expect(!syncEngine.isValid(restarted))
+          #expect(syncEngine.isValid(restarted))
           _ = try await syncEngine.waitForSettlement()
           syncEngine.stop()
         }
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test(arguments: ["event", "account", "stop"])
+      @Test(arguments: ["event", "account", "stop", "drain"])
       func leaseExcludesConcurrentInvalidation(_ kind: String) async throws {
         let token = try await syncEngine.waitForSettlement()
         let engine = syncEngine.private
@@ -138,13 +140,14 @@
         let leaseFinished = SettlementLatch()
         // Use a real thread: other suites temporarily install the main serial executor globally.
         DispatchQueue.global().async { [syncEngine] in
-          result.setValue(Result {
-            try syncEngine.withSettlementLease(token) {
-              entered.signal()
-              #expect(release.wait(timeout: .now() + 5) == .success)
-              return 42
-            }
-          })
+          result.setValue(
+            Result {
+              try syncEngine.withSettlementLease(token) {
+                entered.signal()
+                #expect(release.wait(timeout: .now() + 5) == .success)
+                return 42
+              }
+            })
           leaseFinished.signal()
         }
         await entered.wait()
@@ -157,6 +160,7 @@
           attempted.signal()
           switch kind {
           case "stop": syncEngine.stop()
+          case "drain": await syncEngine.stopAndDrain()
           case "account":
             await syncEngine.handleEvent(
               .accountChange(changeType: .signIn(currentUser: CKRecord.ID(recordName: "user"))),
@@ -237,9 +241,13 @@
         await writerFinished.wait()
         await leaseFinished.wait()
         await event.value
-        #expect(try await writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM lease_receipt") } == 1)
+        #expect(
+          try await writer.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM lease_receipt") }
+            == 1)
         engine.state.remove(pendingRecordZoneChanges: [
-          .saveRecord(CKRecord.ID(recordName: "lease-test:remindersLists", zoneID: CKRecordZone.ID(zoneName: "zone")))
+          .saveRecord(
+            CKRecord.ID(
+              recordName: "lease-test:remindersLists", zoneID: CKRecordZone.ID(zoneName: "zone")))
         ])
         if !stopping {
           await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
@@ -264,6 +272,158 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: [false, true])
+      func retiredMutationsAreRejected(restart: Bool) async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Local") }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let old = syncEngine.private
+        let recordID = RemindersList.recordID(for: 1)
+        let record = try old.database.record(for: recordID)
+        record.setValue("Retired", forKey: "title", at: now + 1)
+        syncEngine.stop()
+        if restart { try await syncEngine.start() }
+        let token = restart ? try await syncEngine.waitForSettlement() : nil
+        let events: [SQLiteData.SyncEngine.Event] = [
+          .fetchedRecordZoneChanges(modifications: [record], deletions: []),
+          .fetchedRecordZoneChanges(
+            modifications: [], deletions: [(recordID, RemindersList.tableName)]),
+          .fetchedDatabaseChanges(modifications: [], deletions: [(recordID.zoneID, .deleted)]),
+          .sentRecordZoneChanges(
+            savedRecords: [record], failedRecordSaves: [], deletedRecordIDs: [],
+            failedRecordDeletes: [:]),
+          .sentRecordZoneChanges(
+            savedRecords: [], failedRecordSaves: [(record, CKError(.quotaExceeded))],
+            deletedRecordIDs: [], failedRecordDeletes: [recordID: CKError(.permissionFailure)]),
+          .accountChange(changeType: .signOut(previousUser: CKRecord.ID(recordName: "old-user"))),
+        ]
+        for event in events { await syncEngine.handleEvent(event, syncEngine: old) }
+        // Package seams must enforce the same admission rule as SDK entry points.
+        await syncEngine.handleFetchedRecordZoneChanges(modifications: [record], syncEngine: old)
+        await syncEngine.handleSentRecordZoneChanges(deletedRecordIDs: [recordID], syncEngine: old)
+        old.state.add(pendingRecordZoneChanges: [.deleteRecord(recordID)])
+        #expect(await syncEngine.nextRecordZoneChangeBatch(syncEngine: old) == nil)
+        try await userDatabase.read { db in
+          try #expect(RemindersList.find(1).fetchOne(db)?.title == "Local")
+        }
+        try await syncEngine.metadatabase.read { db in
+          try #expect(DurableRecordZoneFailure.count().fetchOne(db) == 0)
+        }
+        if let token { #expect(syncEngine.isValid(token)) }
+        #expect(syncEngine.isRunning == restart)
+        old.state.remove(pendingRecordZoneChanges: [.deleteRecord(recordID)])
+        syncEngine.stop()
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func retiredRetryCannotEnqueueIntoRestart() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Local") }
+        }
+        let old = syncEngine.private
+        let recordID = RemindersList.recordID(for: 1)
+        old.database.failNextSave(for: recordID, with: .quotaExceeded)
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        await Task.yield()
+        syncEngine.stop()
+        // Remove the durable failure so startup does not schedule a new, legitimate retry.
+        try await userDatabase.write { db in
+          try DurableRecordZoneFailure.delete().execute(db)
+        }
+        try await syncEngine.start()
+        try await syncEngine.processPendingDatabaseChanges(scope: .private)
+        try await userDatabase.write { db in
+          try DurableRecordZoneFailure.insert {
+            DurableRecordZoneFailure(
+              recordID: recordID, action: DurableRecordZoneFailure.saveAction,
+              recordType: RemindersList.tableName, errorCode: .quotaExceeded,
+              attemptCount: 1, isTerminal: false)
+          }.execute(db)
+        }
+        await testClock.advance(by: .seconds(30))
+        await Task.yield()
+        _ = try await syncEngine.waitForSettlement()
+        #expect(old.state.pendingRecordZoneChanges.isEmpty)
+        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test($syncEngineDelegate.set(DrainAccountDelegate()), arguments: [false, true])
+      func accountCallbackCannotRestartAfterExternalStop(drain: Bool) async throws {
+        let delegate = try #require(syncEngineDelegate as? DrainAccountDelegate)
+        delegate.reset()
+        let callback = Task {
+          await syncEngine.handleEvent(
+            .accountChange(changeType: .signOut(previousUser: CKRecord.ID(recordName: "old"))),
+            syncEngine: syncEngine.private)
+        }
+        await delegate.entered.wait()
+        var barrier: Task<Void, Never>!
+        await withMainSerialExecutor {
+          if drain {
+            barrier = Task { await syncEngine.stopAndDrain() }
+            await Task.yield()
+          } else {
+            syncEngine.stop()
+          }
+          #expect(!syncEngine.isRunning)
+        }
+        delegate.release.signal()
+        await callback.value
+        await barrier?.value
+        #expect(!syncEngine.isRunning)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func concurrentCancelledDrainsCloseAdmission() async throws {
+        try await withMainSerialExecutor {
+          let work = try #require(syncEngine.admit())
+          let finished = LockIsolated(0)
+          syncEngine.stop()
+          let drains = (0..<2).map { _ in
+            Task {
+              await syncEngine.stopAndDrain()
+              finished.withValue { $0 += 1 }
+            }
+          }
+          await Task.yield()
+          drains[0].cancel()
+          #expect(!syncEngine.isRunning)
+          #expect(finished.value == 0)
+          await #expect(throws: CancellationError.self) { try await syncEngine.start() }
+          syncEngine.finish(work)
+          for drain in drains { await drain.value }
+          #expect(finished.value == 2)
+          try await syncEngine.start()
+          #expect(syncEngine.isRunning)
+          syncEngine.stop()
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func stoppedTriggerPersistenceIsDrained() async throws {
+        let work = try #require(syncEngine.admit())
+        syncEngine.stop()
+        syncEngine.didUpdate(
+          recordName: "drain:remindersLists", zoneName: "zone",
+          ownerName: CKCurrentUserDefaultName, oldZoneName: "zone",
+          oldOwnerName: CKCurrentUserDefaultName, descendantRecordNames: nil)
+        syncEngine.finish(work)
+        await syncEngine.stopAndDrain()
+        try await syncEngine.metadatabase.read { db in
+          try #expect(PendingRecordZoneChange.count().fetchOne(db) == 1)
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func unmatchedLifecycleDoesNotStrandDrain() async throws {
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+        await syncEngine.stopAndDrain()
+        #expect(!syncEngine.isRunning)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func tokenCannotBeUsedOnAnotherEngine() async throws {
         let token = try await syncEngine.waitForSettlement()
         let other = SyncSettlement()
@@ -272,6 +432,22 @@
         let otherToken = try await other.wait()
         #expect(!syncEngine.isValid(otherToken))
       }
+    }
+  }
+
+  private final class DrainAccountDelegate: SyncEngineDelegate {
+    private let gates = LockIsolated((entered: SettlementLatch(), release: SettlementLatch()))
+    var entered: SettlementLatch { gates.value.entered }
+    var release: SettlementLatch { gates.value.release }
+    func reset() { gates.setValue((entered: SettlementLatch(), release: SettlementLatch())) }
+    func syncEngine(
+      _ syncEngine: SQLiteData.SyncEngine,
+      accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
+    ) async {
+      guard case .signOut = changeType else { return }
+      entered.signal()
+      await release.wait()
+      do { try await syncEngine.deleteLocalData() } catch { Issue.record(error) }
     }
   }
 

@@ -332,6 +332,149 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: ["fetch", "send", "sync", "fetchReceipt", "sendReceipt"])
+      func drainWaitsForStartup(operation: String) async throws {
+        syncEngine.stop()
+        let gate = CompletionSQLGate()
+        defer { gate.open() }
+        try await userDatabase.database.write { db in
+          db.add(
+            function: DatabaseFunction("drain_start_gate", argumentCount: 0) { _ in
+              gate.block()
+              return 0
+            })
+          try db.execute(
+            sql: """
+              CREATE TEMP TRIGGER drain_start AFTER UPDATE ON sqlitedata_icloud_recordTypes
+              BEGIN SELECT drain_start_gate(); END
+              """)
+        }
+        let start = Task { try await syncEngine.start() }
+        await gate.entered.wait()
+        var explicit: Task<Void, any Error>!
+        await withMainSerialExecutor {
+          explicit = Task {
+            switch operation {
+            case "send": try await syncEngine.sendChanges()
+            case "sync": try await syncEngine.syncChanges()
+            case "fetchReceipt": _ = try await syncEngine.fetchChangesWithReceipt()
+            case "sendReceipt": _ = try await syncEngine.sendChangesWithReceipt()
+            default: try await syncEngine.fetchChanges()
+            }
+          }
+          await Task.yield()
+        }
+        let finished = LockIsolated(false)
+        var drain: Task<Void, Never>!
+        await withMainSerialExecutor {
+          drain = Task {
+            await syncEngine.stopAndDrain()
+            finished.setValue(true)
+          }
+          await Task.yield()
+          #expect(!finished.value)
+          #expect(!syncEngine.isRunning)
+        }
+        gate.open()
+        try await start.value
+        await #expect(throws: CancellationError.self) { try await explicit.value }
+        await drain.value
+        #expect(finished.value)
+        #expect(!syncEngine.isRunning)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func stopDuringAccountResetSuppressesRestart() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Local") }
+        }
+        let gate = CompletionSQLGate()
+        defer { gate.open() }
+        try await userDatabase.database.write { db in
+          db.add(
+            function: DatabaseFunction("drain_reset_gate", argumentCount: 0) { _ in
+              gate.block()
+              return 0
+            })
+          try db.execute(
+            sql: """
+              CREATE TRIGGER drain_reset AFTER DELETE ON remindersLists
+              BEGIN SELECT drain_reset_gate(); END
+              """)
+        }
+        let old = syncEngine.private
+        let callback = Task {
+          await syncEngine.handleEvent(
+            .accountChange(changeType: .signOut(previousUser: CKRecord.ID(recordName: "old"))),
+            syncEngine: old)
+        }
+        await gate.entered.wait()
+        #expect(!syncEngine.isRunning)
+        var drain: Task<Void, Never>!
+        let finished = LockIsolated(false)
+        await withMainSerialExecutor {
+          drain = Task {
+            await syncEngine.stopAndDrain()
+            finished.setValue(true)
+          }
+          await Task.yield()
+          #expect(!finished.value)
+        }
+        gate.open()
+        await callback.value
+        await drain.value
+        #expect(!syncEngine.isRunning)
+        try await userDatabase.read { db in
+          try #expect(RemindersList.count().fetchOne(db) == 0)
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test($syncEngineDelegate.set(CompletionReportingDelegate()), arguments: [false, true])
+      func drainWaitsForApplyAndReport(explicitFetch: Bool) async throws {
+        let delegate = try #require(syncEngineDelegate as? CompletionReportingDelegate)
+        delegate.reset()
+        try await prepareRemoteUpdate(pending: !explicitFetch)
+        let oldEngine = syncEngine.private
+        let apply = CompletionSQLGate()
+        try await installApplyGate(apply, fail: true)
+        defer {
+          apply.open()
+          delegate.release.signal()
+        }
+        let operation = Task {
+          if explicitFetch {
+            try await syncEngine.fetchChanges()
+          } else {
+            await syncEngine.handleEvent(.didFetchChanges, syncEngine: oldEngine)
+          }
+        }
+        await apply.entered.wait()
+        let drained = LockIsolated(false)
+        var drain: Task<Void, Never>!
+        await withMainSerialExecutor {
+          drain = Task {
+            await syncEngine.stopAndDrain()
+            drained.setValue(true)
+          }
+          await Task.yield()
+          #expect(!syncEngine.isRunning)
+          #expect(!drained.value)
+        }
+        await #expect(throws: CancellationError.self) { try await syncEngine.start() }
+        apply.open()
+        await delegate.entered.wait()
+        #expect(!drained.value)
+        delegate.release.signal()
+        try await operation.value
+        await drain.value
+        #expect(delegate.finished.value)
+        #expect(drained.value)
+        #expect(!syncEngine.isRunning)
+        try await expectTitle("Local")
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @discardableResult
       private func prepareRemoteUpdate(
         pending: Bool,
