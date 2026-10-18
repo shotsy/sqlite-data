@@ -1693,10 +1693,22 @@
             record.parent = nil
           }
 
-          record.update(
-            with: T(queryOutput: row),
-            userModificationTime: metadata.userModificationTime
-          )
+          do {
+            try record.update(
+              with: T(queryOutput: row),
+              userModificationTime: metadata.userModificationTime,
+              onError: { throw $0 }
+            )
+          } catch {
+            await reportError(
+              error,
+              context: SyncEngineErrorContext(
+                operation: "sendChanges", recordType: metadata.recordType,
+                isLocalSaveFailure: true, databaseScope: syncEngine.database.databaseScope,
+                zoneID: recordID.zoneID))
+            // Leave the save pending and do not persist or upload a partially prepared record.
+            return nil
+          }
           await refreshLastKnownServerRecord(record)
           sentRecord = recordID
           return record
