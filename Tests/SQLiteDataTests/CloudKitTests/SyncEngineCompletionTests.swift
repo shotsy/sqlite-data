@@ -365,10 +365,10 @@
           await Task.yield()
         }
         let finished = LockIsolated(false)
-        var drain: Task<Void, Never>!
+        var drain: Task<Void, any Error>!
         await withMainSerialExecutor {
           drain = Task {
-            await syncEngine.stopAndDrain()
+            try await syncEngine.stopAndDrain()
             finished.setValue(true)
           }
           await Task.yield()
@@ -378,7 +378,7 @@
         gate.open()
         try await start.value
         await #expect(throws: CancellationError.self) { try await explicit.value }
-        await drain.value
+        try await drain.value
         #expect(finished.value)
         #expect(!syncEngine.isRunning)
       }
@@ -410,11 +410,11 @@
         }
         await gate.entered.wait()
         #expect(!syncEngine.isRunning)
-        var drain: Task<Void, Never>!
+        var drain: Task<Void, any Error>!
         let finished = LockIsolated(false)
         await withMainSerialExecutor {
           drain = Task {
-            await syncEngine.stopAndDrain()
+            try await syncEngine.stopAndDrain()
             finished.setValue(true)
           }
           await Task.yield()
@@ -422,7 +422,7 @@
         }
         gate.open()
         await callback.value
-        await drain.value
+        try await drain.value
         #expect(!syncEngine.isRunning)
         try await userDatabase.read { db in
           try #expect(RemindersList.count().fetchOne(db) == 0)
@@ -451,10 +451,10 @@
         }
         await apply.entered.wait()
         let drained = LockIsolated(false)
-        var drain: Task<Void, Never>!
+        var drain: Task<Void, any Error>!
         await withMainSerialExecutor {
           drain = Task {
-            await syncEngine.stopAndDrain()
+            try await syncEngine.stopAndDrain()
             drained.setValue(true)
           }
           await Task.yield()
@@ -467,7 +467,7 @@
         #expect(!drained.value)
         delegate.release.signal()
         try await operation.value
-        await drain.value
+        try await drain.value
         #expect(delegate.finished.value)
         #expect(drained.value)
         #expect(!syncEngine.isRunning)

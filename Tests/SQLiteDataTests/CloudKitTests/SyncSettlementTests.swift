@@ -160,7 +160,7 @@
           attempted.signal()
           switch kind {
           case "stop": syncEngine.stop()
-          case "drain": await syncEngine.stopAndDrain()
+          case "drain": try await syncEngine.stopAndDrain()
           case "account":
             await syncEngine.handleEvent(
               .accountChange(changeType: .signIn(currentUser: CKRecord.ID(recordName: "user"))),
@@ -173,7 +173,7 @@
         }
         await leaseFinished.wait()
         #expect(try result.value?.get() == 42)
-        await event.value
+        try await event.value
         #expect(!syncEngine.isValid(token))
         if kind == "account" {
           try await syncEngine.processPendingDatabaseChanges(scope: .private)
@@ -359,10 +359,10 @@
             syncEngine: syncEngine.private)
         }
         await delegate.entered.wait()
-        var barrier: Task<Void, Never>!
+        var barrier: Task<Void, any Error>!
         await withMainSerialExecutor {
           if drain {
-            barrier = Task { await syncEngine.stopAndDrain() }
+            barrier = Task { try await syncEngine.stopAndDrain() }
             await Task.yield()
           } else {
             syncEngine.stop()
@@ -371,7 +371,7 @@
         }
         delegate.release.signal()
         await callback.value
-        await barrier?.value
+        try await barrier?.value
         #expect(!syncEngine.isRunning)
       }
 
@@ -383,7 +383,7 @@
           syncEngine.stop()
           let drains = (0..<2).map { _ in
             Task {
-              await syncEngine.stopAndDrain()
+              try await syncEngine.stopAndDrain()
               finished.withValue { $0 += 1 }
             }
           }
@@ -393,7 +393,7 @@
           #expect(finished.value == 0)
           await #expect(throws: CancellationError.self) { try await syncEngine.start() }
           syncEngine.finish(work)
-          for drain in drains { await drain.value }
+          for drain in drains { try await drain.value }
           #expect(finished.value == 2)
           try await syncEngine.start()
           #expect(syncEngine.isRunning)
@@ -410,7 +410,7 @@
           ownerName: CKCurrentUserDefaultName, oldZoneName: "zone",
           oldOwnerName: CKCurrentUserDefaultName, descendantRecordNames: nil)
         syncEngine.finish(work)
-        await syncEngine.stopAndDrain()
+        try await syncEngine.stopAndDrain()
         try await syncEngine.metadatabase.read { db in
           try #expect(PendingRecordZoneChange.count().fetchOne(db) == 1)
         }
@@ -419,7 +419,7 @@
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func unmatchedLifecycleDoesNotStrandDrain() async throws {
         await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
-        await syncEngine.stopAndDrain()
+        try await syncEngine.stopAndDrain()
         #expect(!syncEngine.isRunning)
       }
 
@@ -447,7 +447,7 @@
       guard case .signOut = changeType else { return }
       entered.signal()
       await release.wait()
-      do { try await syncEngine.deleteLocalData() } catch { Issue.record(error) }
+      await #expect(throws: CancellationError.self) { try await syncEngine.deleteLocalData() }
     }
   }
 

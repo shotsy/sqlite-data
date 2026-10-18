@@ -9,12 +9,17 @@
     @TaskLocal static var accountWork: Work?
 
     final class Work: Sendable {
+      let owner: ObjectIdentifier
       let engines: SyncEngines
       let lifetime: UUID
       let stopRevision: UUID
       let startup: SyncStartup
       let active = LockIsolated(true)
-      init(engines: SyncEngines, lifetime: UUID, stopRevision: UUID, startup: SyncStartup) {
+      init(
+        owner: ObjectIdentifier, engines: SyncEngines, lifetime: UUID, stopRevision: UUID,
+        startup: SyncStartup
+      ) {
+        self.owner = owner
         self.engines = engines
         self.lifetime = lifetime
         self.stopRevision = stopRevision
@@ -32,7 +37,8 @@
           else { return nil }
           settlement.begin()
           return Work(
-            engines: engines, lifetime: current, stopRevision: settlement.stopRevision,
+            owner: ObjectIdentifier(self), engines: engines, lifetime: current,
+            stopRevision: settlement.stopRevision,
             startup: startup.withValue(\.self))
         }
       }
@@ -66,6 +72,7 @@
 
     func finish(_ work: Work) {
       settlement.withAdmission {
+        persistRetiredPendingChanges(engines: work.engines)
         work.active.setValue(false)
         settlement.end()
       }

@@ -47,6 +47,23 @@
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
     let startup = LockIsolated(SyncStartup())
     private let mutationTails = SyncMutationTails()
+    private final class RetiredUploadEngine: Sendable {
+      weak let engine: (any SyncEngineProtocol)?
+      let handedOff = LockIsolated<Set<CKSyncEngine.PendingRecordZoneChange>>([])
+      init(_ engine: any SyncEngineProtocol) { self.engine = engine }
+    }
+    // Only external retirement preserves uploads. Account reset invalidates both queued
+    // tails and late finishers; weak identities do not retain retired SDK engines.
+    private let retiredUploadEngines = LockIsolated<[RetiredUploadEngine]>([])
+    private let uploadPersistenceGeneration = LockIsolated(UUID())
+    private struct UploadHandoff: Sendable {
+      let id = UUID()
+      let generation: UUID
+      let changes: [CKSyncEngine.PendingRecordZoneChange]
+    }
+    // Retain ownership until the journal transaction succeeds. A failed write is reported
+    // and retried by the next startup, rather than dropping the retired engine's sole copy.
+    private let uploadHandoffs = LockIsolated<[UploadHandoff]>([])
     // Attempt-local bookkeeping only: engine identity isolates private/shared and replaced
     // engines; UUIDs prevent a later request from inheriting an earlier request's errors.
     // Entries live until the explicit fetch returns, not until the activity flag becomes idle.
@@ -601,12 +618,17 @@
     /// Starts are rejected until all concurrent drains return. Cancellation does not shorten
     /// this barrier. Future retry timers are rejected, not awaited. App-owned database edits,
     /// sharing operations and surveys are not frozen or drained by this method.
+    /// Throws if pending upload intent cannot be persisted. On failure, do not discard this
+    /// engine or replace its storage: repair the persistence failure and retry the drain.
     /// Never await this from a sync delegate or its awaited descendants: it would wait for itself.
-    public func stopAndDrain() async {
+    public func stopAndDrain() async throws {
       retire(draining: true)
       defer { settlement.endDrain() }
       await settlement.drain()
       await mutationTails.drain()
+      // An unstructured task does not inherit caller cancellation. Cancellation must not
+      // skip the final durability check, just as it cannot shorten the settlement barrier.
+      try await Task { try await self.flushUploadHandoffs() }.value
     }
 
     private func retire(draining: Bool = false, external: Bool = true) {
@@ -629,6 +651,22 @@
                   // Rejected terminal callbacks will never remove these windows. Admitted
                   // work retains its own references, already marked interrupted.
                   windows.removeAll()
+                }
+                // Capture before releasing identity: SQL callbacks enqueue under this same
+                // lock. Persistence runs off-lock so a writer never waits on settlement.
+                if external {
+                  let engines = [$0.private, $0.shared].compactMap({ $0 })
+                  retiredUploadEngines.withValue { retired in
+                    retired.removeAll { $0.engine == nil }
+                    for engine in engines {
+                      retired.append(RetiredUploadEngine(engine))
+                    }
+                  }
+                  persistRetiredPendingChanges(engines: $0)
+                } else {
+                  retiredUploadEngines.setValue([])
+                  uploadPersistenceGeneration.setValue(UUID())
+                  uploadHandoffs.setValue([])
                 }
                 $0 = SyncEngines()
               }
@@ -747,6 +785,7 @@
       #endif
       let startTask = Task<Void, Never> {
         defer {
+          persistRetiredPendingChanges(engines: origin)
           completion.finish()
           settlement.end()
         }
@@ -980,10 +1019,15 @@
       previousRecordTypeByTableName: [String: RecordType],
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
+      // A synchronous stop registers its persistence before releasing engine identity.
+      // Also include stopped SQL-trigger tails before consuming the durable handoff.
+      await mutationTails.drain()
+      try await flushUploadHandoffs()
       try await enqueueLocallyPendingChanges(engines: engines)
       try await userDatabase.write { db in
-        try PendingRecordZoneChange.delete().execute(db)
-
+        guard syncEngines.withValue({
+          $0.isRunning && $0.private === engines.private && $0.shared === engines.shared
+        }) else { return }
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
           previousRecordTypeByTableName[tableName] == nil
         }
@@ -997,21 +1041,90 @@
     }
 
     private func enqueueLocallyPendingChanges(engines: SyncEngines) async throws {
-      let pendingRecordZoneChanges = try await metadatabase.read { db in
-        try PendingRecordZoneChange
-          .select(\.pendingRecordZoneChange)
-          .fetchAll(db)
+      try await userDatabase.write { db in
+        try handOffPendingChanges(db: db, engines: engines)
       }
-      let changesByIsPrivate = Dictionary(grouping: pendingRecordZoneChanges) {
-        switch $0 {
-        case .deleteRecord(let recordID), .saveRecord(let recordID):
-          recordID.zoneID.ownerName == CKCurrentUserDefaultName
-        @unknown default:
-          false
+    }
+
+    // Read/delete in one writer transaction, validating identity before enqueue without
+    // acquiring settlement. A retired startup leaves the journal intact. A subsequent stop
+    // captures the enqueued changes before replacing these engines. In particular, never
+    // hold settlement (a lease can wait for this writer), or wait for a writer under identity.
+    private func handOffPendingChanges(db: Database, engines: SyncEngines) throws {
+      let changes = try PendingRecordZoneChange.select(\.pendingRecordZoneChange).fetchAll(db)
+      let handedOff = syncEngines.withValue { current in
+        guard current.isRunning, current.private === engines.private,
+          current.shared === engines.shared
+        else { return false }
+        let changesByIsPrivate = Dictionary(grouping: changes) {
+          switch $0 {
+          case .deleteRecord(let recordID), .saveRecord(let recordID):
+            recordID.zoneID.ownerName == CKCurrentUserDefaultName
+          @unknown default:
+            false
+          }
+        }
+        engines.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
+        engines.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+        return true
+      }
+      // Any retirement tail registered after the enqueue waits for this writer transaction,
+      // so it cannot be erased here. A failed transaction only causes an idempotent replay.
+      if handedOff { try PendingRecordZoneChange.delete().execute(db) }
+    }
+
+    // Work finishing after retirement can have queued retries after retire's snapshot.
+    // Called before ending its settlement ownership; drain includes the registered tail.
+    func persistRetiredPendingChanges(engines: SyncEngines) {
+      syncEngines.withValue { _ in
+        for engine in [engines.private, engines.shared].compactMap({ $0 }) {
+          guard let retired = retiredUploadEngines.withValue({ $0.first { $0.engine === engine } })
+          else { continue }
+          let changes = retired.handedOff.withValue { handedOff in
+            let changes = engine.state.pendingRecordZoneChanges.filter { !handedOff.contains($0) }
+            handedOff.formUnion(changes)
+            return changes
+          }
+          // Snapshot each intent only once: unrelated late finishers must not replay old
+          // deletes after a newer replacement upload, or mutate a retired provider's queue.
+          persistPendingChanges(changes)
         }
       }
-      engines.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
-      engines.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+    }
+
+    private func persistPendingChanges(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      guard !changes.isEmpty else { return }
+      uploadHandoffs.withValue {
+        $0.append(UploadHandoff(generation: uploadPersistenceGeneration.value, changes: changes))
+      }
+      let tail = mutationTails.begin()
+      Task {
+        defer { mutationTails.end(tail) }
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await flushUploadHandoffs()
+        }
+      }
+    }
+
+    private func flushUploadHandoffs() async throws {
+      // Capture on the writer queue, not before awaiting it: concurrent tails drain in
+      // registration order, and cannot replay an earlier delete after a later save.
+      try await userDatabase.write { db in
+        let handoffs = uploadHandoffs.value
+        let changes = handoffs.filter { $0.generation == uploadPersistenceGeneration.value }
+          .flatMap(\.changes)
+        try PendingRecordZoneChange.insert {
+          changes.map { PendingRecordZoneChange($0) }
+        }.execute(db)
+        let current = syncEngines.withValue { $0 }
+        if current.isRunning { try handOffPendingChanges(db: db, engines: current) }
+        // afterNextTransaction commits the ownership transfer, retaining the fallback on
+        // rollback (including errors committing the attached metadata database).
+        db.afterNextTransaction { _ in
+          let ids = Set(handoffs.map(\.id))
+          self.uploadHandoffs.withValue { $0.removeAll { ids.contains($0.id) } }
+        }
+      }
     }
 
     private func enqueueUnknownRecordsForCloudKit() async throws {
@@ -1107,10 +1220,20 @@
     /// ``SyncEngineDelegate`` to the sync engine and implement
     /// ``SyncEngineDelegate/syncEngine(_:accountChanged:)``.
     ///
+    /// Throws `CancellationError` if the engine is stopped or draining before the reset begins.
+    /// An external stop during the reset prevents its automatic restart.
+    ///
     /// > Important: It is only appropriate to call this method when the device's iCloud account
     /// > logs out or changes.
     public func deleteLocalData() async throws {
-      let inherited = Self.accountWork
+      // Task-local work may belong to another engine or outlive its delegate callback.
+      let inherited = settlement.withAdmission { () -> Work? in
+        guard let work = Self.accountWork, work.owner == ObjectIdentifier(self),
+          work.active.value, settlement.stopRevision == work.stopRevision,
+          (try? settlement.currentLifetime()) == work.lifetime, !settlement.isDraining
+        else { return nil }
+        return work
+      }
       let work = inherited ?? admit()
       guard let work else { throw CancellationError() }
       defer { if inherited == nil { finish(work) } }
@@ -1122,7 +1245,7 @@
         retire(external: false)
         return true
       }
-      guard reset else { return }
+      guard reset else { throw CancellationError() }
       defer { settlement.end() }
       try tearDownSyncEngine()
       await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -1187,32 +1310,16 @@
         )
       }
 
-      let queued = syncEngines.withValue { [oldChanges, newChanges] engines in
-        guard engines.isRunning else { return false }
+      syncEngines.withValue { [oldChanges, newChanges] engines in
+        guard engines.isRunning else {
+          persistPendingChanges(oldChanges + newChanges)
+          return
+        }
         let oldEngine =
           oldZoneID.ownerName == CKCurrentUserDefaultName ? engines.private : engines.shared
         let engine = zoneID.ownerName == CKCurrentUserDefaultName ? engines.private : engines.shared
         oldEngine?.state.add(pendingRecordZoneChanges: oldChanges)
         engine?.state.add(pendingRecordZoneChanges: newChanges)
-        return true
-      }
-      guard queued else {
-        let tail = mutationTails.begin()
-        Task { [changes = oldChanges + newChanges] in
-          defer { mutationTails.end(tail) }
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert {
-                  for change in changes {
-                    PendingRecordZoneChange(change)
-                  }
-                }
-                .execute(db)
-            }
-          }
-        }
-        return
       }
     }
 
@@ -1234,25 +1341,13 @@
       if let share {
         changes.append(.deleteRecord(share.recordID))
       }
-      let queued = syncEngines.withValue { [changes] engines in
-        guard engines.isRunning else { return false }
+      syncEngines.withValue { [changes] engines in
+        guard engines.isRunning else {
+          persistPendingChanges(changes)
+          return
+        }
         let engine = zoneID.ownerName == CKCurrentUserDefaultName ? engines.private : engines.shared
         engine?.state.add(pendingRecordZoneChanges: changes)
-        return true
-      }
-      guard queued else {
-        let tail = mutationTails.begin()
-        Task { [changes] in
-          defer { mutationTails.end(tail) }
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert { changes.map { PendingRecordZoneChange($0) } }
-                .execute(db)
-            }
-          }
-        }
-        return
       }
     }
 

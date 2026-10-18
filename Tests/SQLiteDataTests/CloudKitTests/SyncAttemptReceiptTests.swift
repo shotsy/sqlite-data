@@ -470,7 +470,7 @@
           await delegate.entered.wait()
           let drained = LockIsolated(false)
           let drain = Task {
-            await syncEngine.stopAndDrain()
+            try await syncEngine.stopAndDrain()
             drained.setValue(true)
           }
           while syncEngine.isRunning { await Task.yield() }
@@ -478,7 +478,7 @@
           await #expect(throws: CancellationError.self) { try await receipt(send) }
           delegate.release.signal()
           await #expect(throws: CancellationError.self) { try await attempt.value }
-          await drain.value
+          try await drain.value
           #expect(drained.value)
           #expect(delegate.failures.value.count == 1)
         }
@@ -497,14 +497,14 @@
         await delegate.entered.wait()
         let drained = LockIsolated(false)
         let drain = Task {
-          await syncEngine.stopAndDrain()
+          try await syncEngine.stopAndDrain()
           drained.setValue(true)
         }
         while syncEngine.isRunning { await Task.yield() }
         #expect(!drained.value)
         delegate.release.signal()
         await callback.value
-        await drain.value
+        try await drain.value
         #expect(drained.value)
         #expect(delegate.failures.value.count == 1)
       }
@@ -514,7 +514,7 @@
         let entered = ReceiptLatch()
         let release = ReceiptLatch()
         let recordID = RemindersList.recordID(for: 999)
-        await scripted({ _, _ in }, beforeProvider: {
+        try await scripted({ _, _ in }, beforeProvider: {
           entered.signal()
           await release.wait()
         }) {
@@ -524,17 +524,20 @@
           await entered.wait()
           let drained = LockIsolated(false)
           let drain = Task {
-            await syncEngine.stopAndDrain()
+            try await syncEngine.stopAndDrain()
             drained.setValue(true)
           }
           while syncEngine.isRunning { await Task.yield() }
           #expect(!drained.value)
           release.signal()
           #expect(await batch.value?.recordsToSave.isEmpty == true)
-          await drain.value
-          // A provider admitted after stop would remove this missing record from the queue.
-          #expect(engine.state.pendingRecordZoneChanges == [.saveRecord(recordID)])
-          engine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
+          try await drain.value
+          // Retirement transfers the queue into the journal; the late provider must not
+          // consume the missing record's preserved upload intent.
+          let pending = try? await syncEngine.metadatabase.read { db in
+            try PendingRecordZoneChange.select(\.pendingRecordZoneChange).fetchAll(db)
+          }
+          #expect(pending?.contains(.saveRecord(recordID)) == true)
         }
         syncEngine.stop()
       }
