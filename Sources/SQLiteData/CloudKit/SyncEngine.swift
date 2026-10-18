@@ -34,6 +34,7 @@
     let foreignKeysByTableName: [String: [ForeignKey]]
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
     package let settlement = SyncSettlement()
+    let attempts = SyncAttempts()
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -596,6 +597,7 @@
             settlement.withAdmission {
               syncEngines.withValue {
                 settlement.stop()
+                attempts.invalidate()
                 transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
                 $0 = SyncEngines()
               }
@@ -751,6 +753,10 @@
     public func fetchChanges(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
     ) async throws {
+      _ = try await runAttempt(receipt: false) { try await self.performFetchChanges(options) }
+    }
+
+    func performFetchChanges(_ options: CKSyncEngine.FetchChangesOptions) async throws {
       settlement.begin()
       defer { settlement.end() }
       await startTask.withValue(\.self)?.value
@@ -801,9 +807,8 @@
         let reports = fetchErrorReports.withValue { $0[attemptID]?.reports ?? [] }
           .filter { $0.error.isEqual(error as NSError) }
         if reports.isEmpty {
-          await delegate?.syncEngine(
-            self,
-            didReportError: error,
+          await reportError(
+            error,
             context: SyncEngineErrorContext(
               operation: .fetchChanges,
               databaseScope: syncEngine.database.databaseScope
@@ -813,6 +818,19 @@
           // An event can be suspended inside the delegate when the explicit fetch throws.
           // Cancellation must not let the throwing path escape that delivery boundary.
           for report in reports { await report.wait() }
+          for attempt in Self.attemptOwners {
+            attempt.state.withValue {
+              guard
+                !$0.failures.contains(where: { ($0.error as NSError).isEqual(error as NSError) })
+              else { return }
+              $0.failures.append(
+                .init(
+                  attemptID: attempt.id, error: error,
+                  context: SyncEngineErrorContext(
+                    operation: .fetchChanges,
+                    databaseScope: syncEngine.database.databaseScope)))
+            }
+          }
         }
         throw error
       }
@@ -831,9 +849,8 @@
         }
       }
       defer { report.finish() }
-      await delegate?.syncEngine(
-        self,
-        didReportError: error,
+      await reportError(
+        error,
         context: SyncEngineErrorContext(
           operation: .fetchRecordZoneChanges,
           databaseScope: syncEngine.database.databaseScope,
@@ -853,6 +870,10 @@
     public func sendChanges(
       _ options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws {
+      _ = try await runAttempt(receipt: false) { try await self.performSendChanges(options) }
+    }
+
+    func performSendChanges(_ options: CKSyncEngine.SendChangesOptions) async throws {
       settlement.begin()
       defer { settlement.end() }
       await startTask.withValue(\.self)?.value
@@ -869,6 +890,11 @@
           await finishTransfer(engine, upload: true, explicit: true)
         } catch {
           window.mark(error is CancellationError ? .interrupted : .failed)
+          recordAttemptFailure(
+            error,
+            context: SyncEngineErrorContext(
+              operation: "sendChanges", databaseScope: engine.database.databaseScope)
+          )
           await finishTransfer(engine, upload: true, explicit: true)
           throw error
         }
@@ -1310,15 +1336,19 @@
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
       // Register before any actor hop, atomically with engine retirement. The final did-fetch
       // event owns its lifecycle count until application and all awaited reports return.
-      settlement.withAdmission {
+      let owners = settlement.withAdmission {
         syncEngines.withValue {
           settlement.beginEvent(
             event, engine: syncEngine,
             isCurrent: $0.private === syncEngine || $0.shared === syncEngine
           )
         }
+        return attempts.admit(syncEngine, event: event)
       }
-      defer { settlement.endEvent(event, engine: syncEngine) }
+      defer {
+        attempts.end(syncEngine)
+        settlement.endEvent(event, engine: syncEngine)
+      }
       // A racing final boundary cannot certify work still applying or reporting an error.
       let activeTransfer = transfers.withValue { windows -> Transfer? in
         let upload: Bool
@@ -1337,7 +1367,10 @@
       defer { activeTransfer?.state.withValue { $0.active -= 1 } }
       await Self.$isTransferEvent.withValue(true) {
         await Self.$eventTransfer.withValue(activeTransfer) {
-          await handleTransferEvent(event, syncEngine: syncEngine)
+          await Self.$attemptOwners.withValue(owners) {
+            await handleTransferEvent(event, syncEngine: syncEngine)
+            await deliverAttemptFailures(owners)
+          }
         }
       }
     }
@@ -1359,8 +1392,16 @@
           deletions: deletions,
           syncEngine: syncEngine
         )
-      case .sentDatabaseChanges:
-        break
+      case .sentDatabaseChanges(_, let failedSaves, _, let failedDeletes):
+        for (zoneID, error) in failedSaves.map({ ($0.zone.zoneID, $0.error) })
+          + failedDeletes.map({ ($0.key, $0.value) })
+        {
+          recordAttemptFailure(
+            error,
+            context: SyncEngineErrorContext(
+              operation: "sentDatabaseChanges", databaseScope: syncEngine.database.databaseScope,
+              zoneID: zoneID))
+        }
       case .fetchedRecordZoneChanges(let modifications, let deletions):
         await handleFetchedRecordZoneChanges(
           modifications: modifications,
@@ -1428,8 +1469,26 @@
       options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions(scope: .all),
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
-      settlement.begin()
-      defer { settlement.end() }
+      let owners = settlement.withAdmission {
+        settlement.begin()
+        return attempts.admit(syncEngine)
+      }
+      defer {
+        attempts.end(syncEngine)
+        settlement.end()
+      }
+      return await Self.$attemptOwners.withValue(owners) {
+        let batch = await makeRecordZoneChangeBatch(
+          reason: reason, options: options, syncEngine: syncEngine)
+        await deliverAttemptFailures(owners)
+        return batch
+      }
+    }
+
+    private func makeRecordZoneChangeBatch(
+      reason: CKSyncEngine.SyncReason, options: CKSyncEngine.SendChangesOptions,
+      syncEngine: any SyncEngineProtocol
+    ) async -> CKSyncEngine.RecordZoneChangeBatch? {
       var changes = await pendingRecordZoneChanges(options: options, syncEngine: syncEngine)
       guard !changes.isEmpty
       else { return nil }
@@ -1477,10 +1536,13 @@
         }
       #endif
 
+      let owners = Self.attemptOwners
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
+        settlement.begin()
+        defer { settlement.end() }
+        let record = await Self.$attemptOwners.withValue(owners) { () async -> CKRecord? in
         guard
-          let (metadata, allFields) = await withErrorReporting(
-            .sqliteDataCloudKitFailure,
+            let (metadata, allFields) = await withAttemptErrorReporting(
             catching: {
               try await metadatabase.read { db in
                 try SyncMetadata
@@ -1529,7 +1591,7 @@
         }
         func open<T>(_: some SynchronizableTable<T>) async -> CKRecord? {
           let row =
-            await withErrorReporting(.sqliteDataCloudKitFailure) {
+              await withAttemptErrorReporting {
               // NB: Fake 'sending' result.
               nonisolated(unsafe) var result: T.QueryOutput?
               try await userDatabase.read { db in
@@ -1571,15 +1633,30 @@
             record.parent = nil
           }
 
-          record.update(
-            with: T(queryOutput: row),
-            userModificationTime: metadata.userModificationTime
-          )
+          do {
+            try record.update(
+              with: T(queryOutput: row),
+              userModificationTime: metadata.userModificationTime,
+              onError: { throw $0 }
+            )
+          } catch {
+            await reportError(
+              error,
+              context: SyncEngineErrorContext(
+                operation: "sendChanges", recordType: metadata.recordType,
+                isLocalSaveFailure: true, databaseScope: syncEngine.database.databaseScope,
+                zoneID: recordID.zoneID))
+            // Leave the save pending and do not persist or upload a partially prepared record.
+            return nil
+          }
           await refreshLastKnownServerRecord(record)
           sentRecord = recordID
           return record
         }
         return await open(table)
+        }
+        await deliverAttemptFailures(owners)
+        return record
       }
       return batch
     }
@@ -1601,8 +1678,7 @@
       guard !candidateDeletes.isEmpty else { return changes }
       let isSharedDatabase = syncEngine.database.databaseScope == .shared
       guard
-        let decision = await withErrorReporting(
-          .sqliteDataCloudKitFailure,
+        let decision = await withAttemptErrorReporting(
           catching: {
             try await userDatabase.write { db in
               var changes = changes
@@ -1710,6 +1786,7 @@
       guard syncEngine === syncEngines.private
       else { return }
 
+      attempts.invalidate()
       transfers.withValue { $0.values.forEach { $0.mark(.interrupted) } }
       switch changeType {
       case .signIn:
@@ -1737,7 +1814,10 @@
       stateSerialization: CKSyncEngine.State.Serialization,
       syncEngine: any SyncEngineProtocol
     ) async {
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
+      await withAttemptErrorReporting(
+        SyncEngineErrorContext(
+          operation: "stateUpdate", databaseScope: syncEngine.database.databaseScope)
+      ) {
         try await userDatabase.write { db in
           try StateSerialization.upsert {
             StateSerialization.Draft(
@@ -1755,10 +1835,15 @@
       deletions: [(zoneID: CKRecordZone.ID, reason: CKDatabase.DatabaseChange.Deletion.Reason)],
       syncEngine: any SyncEngineProtocol
     ) async {
+      let nestedFailures = LockIsolated<[(any Error, CKRecordZone.ID)]>([])
       for (zoneID, reason) in deletions {
         guard reason == .deleted || reason == .purged else { continue }
         let recordCountsByType =
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
+          await withAttemptErrorReporting(
+            SyncEngineErrorContext(
+              operation: .zoneDeletion, databaseScope: syncEngine.database.databaseScope,
+              zoneID: zoneID)
+          ) {
             try await metadatabase.read { db in
               Dictionary(
                 grouping:
@@ -1785,7 +1870,10 @@
       // NB: 'syncEngine.state' must not be mutated inside this transaction: if a later statement
       //     throws, the database rolls back but the sync engine state would not.
       let deletionResults =
-        await withErrorReporting(.sqliteDataCloudKitFailure) {
+        await withAttemptErrorReporting(
+          SyncEngineErrorContext(
+            operation: .zoneDeletion, databaseScope: syncEngine.database.databaseScope)
+        ) {
           try await userDatabase.write { db in
             var defaultZoneDeleted = false
             var pendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
@@ -1799,12 +1887,23 @@
               case .encryptedDataReset:
                 pendingRecordZoneChanges += try uploadRecords(in: zoneID, db: db)
               @unknown default:
+                nestedFailures.withValue {
+                  $0.append(
+                    (NSError(domain: "SQLiteData.UnknownZoneDeletionReason", code: 1), zoneID))
+                }
                 reportIssue("Unknown deletion reason: \(reason)")
               }
             }
             return (defaultZoneDeleted, pendingRecordZoneChanges)
           }
         }
+      for (error, zoneID) in nestedFailures.value {
+        recordAttemptFailure(
+          error,
+          context: SyncEngineErrorContext(
+            operation: .zoneDeletion, databaseScope: syncEngine.database.databaseScope,
+            zoneID: zoneID))
+      }
       if let deletionResults {
         syncEngine.state.add(pendingRecordZoneChanges: deletionResults.1)
         if deletionResults.0 {
@@ -1829,7 +1928,13 @@
           else { continue }
           func open<T: PrimaryKeyedTable>(_: some SynchronizableTable<T>) {
             withErrorReporting(.sqliteDataCloudKitFailure) {
-              try T.unscoped.where { #sql("\($0.primaryKey)").in(primaryKeys) }.delete().execute(db)
+              do {
+                try T.unscoped.where { #sql("\($0.primaryKey)").in(primaryKeys) }.delete().execute(
+                  db)
+              } catch {
+                nestedFailures.withValue { $0.append((error, zoneID)) }
+                throw error
+              }
             }
           }
           open(table)
@@ -1853,11 +1958,16 @@
           else { continue }
           func open<T>(_: some SynchronizableTable<T>) {
             withErrorReporting(.sqliteDataCloudKitFailure) {
-              pendingRecordZoneChanges.append(
-                contentsOf: try T.unscoped.select(\._recordName).fetchAll(db).map {
-                  .saveRecord(CKRecord.ID(recordName: $0, zoneID: zoneID))
-                }
-              )
+              do {
+                pendingRecordZoneChanges.append(
+                  contentsOf: try T.unscoped.select(\._recordName).fetchAll(db).map {
+                    .saveRecord(CKRecord.ID(recordName: $0, zoneID: zoneID))
+                  }
+                )
+              } catch {
+                nestedFailures.withValue { $0.append((error, zoneID)) }
+                throw error
+              }
             }
           }
           open(table)
@@ -1876,22 +1986,26 @@
       let window = transfer(syncEngine)
       window?.state.withValue { $0.active += 1 }
       defer { window?.state.withValue { $0.active -= 1 } }
-      @Sendable func report(_ error: any Error) async {
-        guard let window else { return }
-        window.mark(error is CancellationError ? .interrupted : .failed)
-        await delegate?.syncEngine(
-          self, didReportError: error,
-          context: SyncEngineErrorContext(
-            operation: .fetchedRecordApplication, databaseScope: syncEngine.database.databaseScope
-          )
-        )
+      @Sendable func report(
+        _ error: any Error, operation: SyncEngineOperation = .fetchedRecordApplication
+      ) async {
+        window?.mark(error is CancellationError ? .interrupted : .failed)
+        let context = SyncEngineErrorContext(
+          operation: operation, databaseScope: syncEngine.database.databaseScope)
+        recordAttemptFailure(error, context: context)
+        // Preserve the legacy error delegate's no-window behavior; the failure receipt is
+        // unconditional and is flushed by the owning event/attempt after application settles.
+        if window != nil {
+          await delegate?.syncEngine(self, didReportError: error, context: context)
+        }
       }
       @Sendable func applying<T: Sendable>(
+        operation: SyncEngineOperation = .fetchedRecordApplication,
         _ body: @Sendable () async throws -> T
       ) async -> T? {
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           do { return try await body() } catch {
-            await report(error)
+            await report(error, operation: operation)
             throw error
           }
         }
@@ -1956,15 +2070,15 @@
                 }
               } catch {
                 window?.mark(error is CancellationError ? .interrupted : .failed)
-                await delegate?.syncEngine(
-                  self,
-                  didReportError: error,
+                await reportError(
+                  error,
                   context: SyncEngineErrorContext(
                     operation: .fetchedRecordDeletion,
                     disposition: .terminalDroppedOrReconciled,
                     tableName: T.tableName,
                     recordType: recordType,
-                    isRemoteDelete: true
+                    isRemoteDelete: true,
+                    databaseScope: syncEngine.database.databaseScope
                   )
                 )
                 throw error
@@ -1974,13 +2088,13 @@
           await open(table)
         } else if recordType == CKRecord.SystemType.share {
           for shareRecordID in recordIDs {
-            await applying {
+            await applying(operation: .fetchedRecordDeletion) {
               try await deleteShare(shareRecordID: shareRecordID)
             }
           }
         } else {
           // NB: Deleting a record from a table we do not currently recognize.
-          await applying {
+          await applying(operation: .fetchedRecordDeletion) {
             try await userDatabase.write { db in
               try SyncMetadata
                 .findAll(recordIDs)
@@ -2068,8 +2182,9 @@
         } else {
           do {
             let version = SyncEngineRecordVersion(record)
+            let owners = Self.attemptOwners
             let application = try await userDatabase.write { db in
-              try upsertFromServerRecord(record, db: db)
+              try upsertFromServerRecord(record, owners: owners, db: db)
             }
             switch application {
             case .applied where version != nil:
@@ -2081,6 +2196,7 @@
               _ = window?.state.withValue { $0.deferred.insert(record.recordID) }
             default:
               window?.mark(.unconfirmed)
+              for owner in owners { owner.state.withValue { $0.uncertain = true } }
             }
           } catch let error as CancellationError {
             window?.mark(.interrupted)
@@ -2095,7 +2211,11 @@
               }
               + modifications[index...].map(\.recordID)
             await Task {
-              await withErrorReporting(.sqliteDataCloudKitFailure) {
+              await withAttemptErrorReporting(
+                SyncEngineErrorContext(
+                  operation: .fetchedRecordApplication,
+                  databaseScope: syncEngine.database.databaseScope)
+              ) {
                 try await userDatabase.write { db in
                   try UnsyncedRecordID.insert {
                     recordIDs.map { UnsyncedRecordID(recordID: $0) }
@@ -2106,9 +2226,8 @@
               }
             }
             .value
-            await delegate?.syncEngine(
-              self,
-              didReportError: error,
+            await reportError(
+              error,
               context: SyncEngineErrorContext(
                 operation: .fetchedRecordApplication,
                 disposition: .transientPendingRetry,
@@ -2119,9 +2238,8 @@
             return
           } catch {
             window?.mark(.failed)
-            await delegate?.syncEngine(
-              self,
-              didReportError: error,
+            await reportError(
+              error,
               context: SyncEngineErrorContext(
                 operation: .fetchedRecordApplication,
                 disposition: .terminalDroppedOrReconciled,
@@ -2188,7 +2306,7 @@
       recordID: CKRecord.ID,
       action: String
     ) async -> DurableRecordZoneFailure? {
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
+      await withAttemptErrorReporting {
         try await metadatabase.read { db in
           try DurableRecordZoneFailure.find(recordID, action: action).fetchOne(db)
         }
@@ -2213,7 +2331,7 @@
         attemptCount: attemptCount,
         isTerminal: isTerminal
       )
-      return await withErrorReporting(.sqliteDataCloudKitFailure) {
+      return await withAttemptErrorReporting {
         try await userDatabase.write { db in
           try DurableRecordZoneFailure.insert { failure } onConflictDoUpdate: {
             $0.recordType = failure.recordType
@@ -2229,7 +2347,7 @@
 
     private func clearDurableRecordZoneFailures(recordIDs: [CKRecord.ID]) async {
       guard !recordIDs.isEmpty else { return }
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
+      await withAttemptErrorReporting {
         try await userDatabase.write { db in
           try DurableRecordZoneFailure
             .where {
@@ -2320,10 +2438,22 @@
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
       for (failedRecord, error) in failedRecordSaves {
+        recordAttemptFailure(
+          error,
+          context: SyncEngineErrorContext(
+            operation: .sentRecordSave, recordType: failedRecord.recordType,
+            isLocalSaveFailure: true,
+            databaseScope: syncEngine.database.databaseScope, zoneID: failedRecord.recordID.zoneID))
         func reportLocalSaveFailure(
           _ reportedError: any Error = error,
           disposition: SyncEngineErrorDisposition
         ) async {
+          if !(reportedError as NSError).isEqual(error as NSError) {
+            recordAttemptFailure(
+              reportedError,
+              context: SyncEngineErrorContext(
+                operation: .sentRecordSave, databaseScope: syncEngine.database.databaseScope))
+          }
           await delegate?.syncEngine(
             self,
             didReportError: reportedError,
@@ -2349,7 +2479,7 @@
         }
 
         func clearServerRecord() async {
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
+          await withAttemptErrorReporting {
             try await userDatabase.write { db in
               try SyncMetadata
                 .find(failedRecord.recordID)
@@ -2547,8 +2677,16 @@
         }
       }
 
+      for (recordID, error) in failedRecordDeletes {
+        recordAttemptFailure(
+          error,
+          context: SyncEngineErrorContext(
+            operation: .sentRecordDelete, recordType: recordID.tableName,
+            isLocalDeleteFailure: true,
+            databaseScope: syncEngine.database.databaseScope, zoneID: recordID.zoneID))
+      }
       let failedDeleteHandling =
-        await withErrorReporting(.sqliteDataCloudKitFailure) {
+        await withAttemptErrorReporting {
           try await userDatabase.write { db in
             var enqueuedUnsyncedRecordID = false
             var reportedFailures: [(
@@ -2721,8 +2859,9 @@
       _ serverRecord: CKRecord,
       force: Bool = false
     ) async throws {
+      let owners = Self.attemptOwners
       _ = try await userDatabase.write { db in
-        try upsertFromServerRecord(serverRecord, force: force, db: db)
+        try upsertFromServerRecord(serverRecord, force: force, owners: owners, db: db)
       }
     }
 
@@ -2732,6 +2871,7 @@
     private func upsertFromServerRecord(
       _ serverRecord: CKRecord,
       force: Bool = false,
+      owners: [SyncAttempt],
       db: Database
     ) throws -> RecordApplication {
       guard
@@ -2793,7 +2933,15 @@
 
         do {
           try $_currentZoneID.withValue(serverRecord.recordID.zoneID) {
-            try #sql(upsert(table, record: serverRecord, columnNames: columnNames)).execute(db)
+            try #sql(
+              upsert(table, record: serverRecord, columnNames: columnNames) { error in
+                recordAttemptFailure(
+                  error,
+                  context: SyncEngineErrorContext(
+                    operation: .fetchedRecordApplication, recordType: serverRecord.recordType,
+                    zoneID: serverRecord.recordID.zoneID), owners: owners)
+              }
+            ).execute(db)
           }
           try UnsyncedRecordID.find(serverRecord.recordID).delete().execute(db)
           try SyncMetadata
@@ -2811,10 +2959,19 @@
             "\(quote: $0) COLLATE BINARY IS \(serverRecord.encryptedValues[$0]?.queryFragment ?? "NULL")"
               as QueryFragment
           }.joined(separator: " AND ")
-          let count = try? #sql(
-            "SELECT count(*) FROM \(T.self) WHERE \(matches)", as: Int.self
-          ).fetchOne(db)
-          return count == 1 ? .applied : .unconfirmed
+          do {
+            let count = try #sql(
+              "SELECT count(*) FROM \(T.self) WHERE \(matches)", as: Int.self
+            ).fetchOne(db)
+            return count == 1 ? .applied : .unconfirmed
+          } catch {
+            recordAttemptFailure(
+              error,
+              context: SyncEngineErrorContext(
+                operation: .fetchedRecordApplication, recordType: serverRecord.recordType),
+              owners: owners)
+            return .unconfirmed
+          }
         } catch {
           guard
             let error = error as? DatabaseError,
@@ -2823,6 +2980,12 @@
           else {
             throw error
           }
+          recordAttemptFailure(
+            error,
+            context: SyncEngineErrorContext(
+              operation: .fetchedRecordApplication, disposition: .transientPendingRetry,
+              recordType: serverRecord.recordType, zoneID: serverRecord.recordID.zoneID),
+            owners: owners)
           try UnsyncedRecordID.insert {
             UnsyncedRecordID(recordID: serverRecord.recordID)
           } onConflictDoUpdate: { _ in
@@ -2835,7 +2998,7 @@
     }
 
     private func refreshLastKnownServerRecord(_ record: CKRecord) async {
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
+      await withAttemptErrorReporting {
         try await userDatabase.write { db in
           let metadata = try SyncMetadata.find(record.recordID).fetchOne(db)
           func updateLastKnownServerRecord() throws {
@@ -3302,7 +3465,8 @@
   private func upsert<T>(
     _: some SynchronizableTable<T>,
     record: CKRecord,
-    columnNames: some Collection<String>
+    columnNames: some Collection<String>,
+    onAssetFailure: (any Error) -> Void
   ) -> QueryFragment {
     let setColumnNames = T.TableColumns.writableColumns.map(\.name)
       .filter { record.hasSet(key: $0) }
@@ -3320,8 +3484,13 @@
         .map { columnName in
           if let asset = record[columnName] as? CKAsset {
             @Dependency(\.dataManager) var dataManager
-            return (try? asset.fileURL.map { try dataManager.load($0) })?
-              .queryFragment ?? "NULL"
+            do {
+              guard let url = asset.fileURL else { throw CKError(.assetFileNotFound) }
+              return try dataManager.load(url).queryFragment
+            } catch {
+              onAssetFailure(error)
+              return "NULL"
+            }
           } else {
             return record.encryptedValues[columnName]?.queryFragment ?? "NULL"
           }

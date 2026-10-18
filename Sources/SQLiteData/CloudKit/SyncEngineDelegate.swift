@@ -81,7 +81,9 @@
     }
 
     /// Creates context for a string operation, retaining compatibility with custom operations.
-    /// Known operation raw values also populate `operationKind`.
+    /// Known operation raw values also populate `operationKind`. New receipt operations
+    /// `sendChanges` and `sentDatabaseChanges` remain string-only so adding receipt support
+    /// does not break existing exhaustive switches over `SyncEngineOperation`.
     public init(
       operation: String,
       tableName: String? = nil,
@@ -273,6 +275,15 @@
       context: SyncEngineErrorContext
     ) async
 
+    /// An epoch-bound failure observation, including standalone automatic fetch/send cycles.
+    /// Awaited outside database writers; the default is a no-op. Automatic epochs are conservative
+    /// lifecycle windows, not unique CloudKit request IDs. Overlap may report a failure for multiple
+    /// epochs. Captured callbacks retain their original epoch across awaits and lifecycle endings.
+    /// There is no automatic success callback; use the explicit receipt APIs for settled success.
+    func syncEngine(
+      _ syncEngine: SyncEngine, didReportFailure failure: SyncEngine.AttemptReceipt.Failure)
+      async
+
     /// Capture app identity without suspension. Return nil when identity/coverage is unavailable.
     /// Called before async transfer work; implementations must not call back into this engine.
     func syncEngine(
@@ -312,6 +323,10 @@
       _ syncEngine: SyncEngine,
       didReportError error: any Error,
       context: SyncEngineErrorContext
+    ) async {}
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine, didReportFailure failure: SyncEngine.AttemptReceipt.Failure
     ) async {}
 
     public func syncEngine(

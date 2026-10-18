@@ -169,6 +169,8 @@
       }
     }
 
+    var hasWork: Bool { state.withValue { $0.active > 0 || !$0.activities.isEmpty } }
+
     func currentLifetime() throws -> UUID {
       try state.withValue {
         guard let lifetime = $0.lifetime else { throw CancellationError() }
