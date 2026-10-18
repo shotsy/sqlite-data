@@ -462,7 +462,8 @@
           await #expect(throws: CKError.self) { try await syncEngine.syncChanges() }
           #expect(fetches.value == 0)
           #expect(delegate.failures.value.count == 1)
-          #expect(delegate.failures.value.first?.context.operationKind == .sendChanges)
+          #expect(delegate.failures.value.first?.context.operation == "sendChanges")
+          #expect(delegate.failures.value.first?.context.operationKind == nil)
         }
       }
 
