@@ -37,13 +37,19 @@
       state.withValue { state in
         state.entries = state.entries.filter { $0.value.engine != nil }
         for engine in [engines.private, engines.shared].compactMap({ $0 }) {
-          state.entries[ObjectIdentifier(engine)] = Entry(engine: engine, generation: state.generation)
+          let key = ObjectIdentifier(engine)
+          if state.entries[key]?.engine !== engine {
+            state.entries[key] = Entry(engine: engine, generation: state.generation)
+          }
         }
       }
     }
 
     func isRetired(_ engine: any SyncEngineProtocol) -> Bool {
-      state.withValue { $0.entries[ObjectIdentifier(engine)]?.retired == true }
+      state.withValue {
+        let entry = $0.entries[ObjectIdentifier(engine)]
+        return entry?.engine === engine && entry?.retired == true
+      }
     }
 
     // Register before the SDK can consume its queue, not after the async batch provider returns.
@@ -52,6 +58,7 @@
     ) -> Bool {
       state.withValue { state in
         let key = ObjectIdentifier(engine)
+        guard state.entries[key]?.engine === engine else { return true }
         guard state.entries[key]?.retired != true else { return false }
         for change in changes {
           state.entries[key]?.inFlight[change, default: 0] += 1
@@ -63,6 +70,7 @@
     func acknowledge(_ changes: [CKSyncEngine.PendingRecordZoneChange], engine: any SyncEngineProtocol) {
       state.withValue { state in
         let key = ObjectIdentifier(engine)
+        guard state.entries[key]?.engine === engine else { return }
         for change in changes {
           guard let count = state.entries[key]?.inFlight[change] else { continue }
           state.entries[key]?.inFlight[change] = count > 1 ? count - 1 : nil
@@ -82,16 +90,29 @@
       }
     }
 
+    func retireAll() -> [any SyncEngineProtocol] {
+      state.withValue { state in
+        let engines = state.entries.values.compactMap(\.engine)
+        for engine in engines { state.entries[ObjectIdentifier(engine)]?.retired = true }
+        return engines
+      }
+    }
+
     // Explicit retirement only. Ordinary stop() neither calls this nor rejects callbacks.
     // Capture only after quiescence (or in tests with no admitted work). Each capture is a delta:
     // retain ALL snapshots until persistence succeeds, and persist before allowing restart.
     // Failure must not be reported as a successful drain. Never recapture to retry a failed write.
     func capture(_ engines: SyncEngines) -> Snapshot {
+      capture([engines.private, engines.shared].compactMap { $0 })
+    }
+
+    func capture(_ engines: [any SyncEngineProtocol]) -> Snapshot {
       state.withValue { state in
         var changes: Set<CKSyncEngine.PendingRecordZoneChange> = []
-        for engine in [engines.private, engines.shared].compactMap({ $0 }) {
+        for engine in engines {
           let key = ObjectIdentifier(engine)
-          guard var entry = state.entries[key], entry.generation == state.generation else { continue }
+          guard var entry = state.entries[key], entry.engine === engine,
+            entry.generation == state.generation else { continue }
           entry.retired = true
           let pending = Set(entry.inFlight.keys).union(engine.state.pendingRecordZoneChanges)
           changes.formUnion(pending.subtracting(entry.captured))

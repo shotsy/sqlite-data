@@ -76,12 +76,18 @@
       var lifetime: UUID?
       var epoch = UUID()
       var active = 0
+      var drainWaiters: [CheckedContinuation<Void, Never>] = []
       var consuming = false
       var activities: [Key: Int] = [:]
       var waiters: [UUID: CheckedContinuation<SyncEngine.SettledToken, any Error>] = [:]
       var isSettled: Bool { lifetime != nil && active == 0 && activities.isEmpty }
 
       func resumeIfSettled() {
+        if active == 0 {
+          let continuations = drainWaiters
+          drainWaiters.removeAll()
+          for continuation in continuations { continuation.resume() }
+        }
         guard isSettled else { return }
         let token = SyncEngine.SettledToken(epoch: epoch)
         let continuations = waiters.values
@@ -95,6 +101,15 @@
     // for a lease while holding a lock needed by synchronous database-trigger callbacks.
     func withAdmission<Result: Sendable>(_ body: @Sendable () throws -> Result) rethrows -> Result {
       try state.withValue { _ in try body() }
+    }
+
+    func drain() async {
+      await withCheckedContinuation { continuation in
+        state.withValue {
+          $0.drainWaiters.append(continuation)
+          $0.resumeIfSettled()
+        }
+      }
     }
 
     func start() -> UUID {
