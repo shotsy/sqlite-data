@@ -36,7 +36,8 @@
           #expect(failure.attemptID == result.attemptID)
           #expect(failure.error as NSError === error)
           #expect(failure.context.databaseScope == scope)
-          #expect(failure.context.operationKind == (send ? .sendChanges : .fetchChanges))
+          #expect(failure.context.operation == (send ? "sendChanges" : "fetchChanges"))
+          #expect(failure.context.operationKind == (send ? nil : .fetchChanges))
         }
       }
 
@@ -74,7 +75,8 @@
           let result = try await receipt(true)
           #expect(result.result == .failed)
           #expect(result.failures.count == 1)
-          #expect(result.failures.first?.context.operationKind == .sentDatabaseChanges)
+          #expect(result.failures.first?.context.operation == "sentDatabaseChanges")
+          #expect(result.failures.first?.context.operationKind == nil)
           #expect(result.failures.first?.context.databaseScope == .shared)
           #expect(result.failures.first?.context.zoneID == zone.zoneID)
         }
@@ -364,7 +366,7 @@
         #expect(delegate.failures.value.count == 2)
         #expect(delegate.failures.value[0].attemptID == delegate.failures.value[1].attemptID)
         #expect(
-          delegate.failures.value.allSatisfy { $0.context.operationKind == .sentDatabaseChanges })
+          delegate.failures.value.allSatisfy { $0.context.operation == "sentDatabaseChanges" })
       }
 
       @Test($syncEngineDelegate.set(ReceiptFailureDelegate()))
