@@ -1,0 +1,473 @@
+#if canImport(CloudKit)
+  import CloudKit
+  import ConcurrencyExtras
+  @testable import SQLiteData
+  import Testing
+  import TestLocals
+
+  extension BaseCloudKitTests {
+    @MainActor
+    final class SyncAttemptReceiptTests: BaseCloudKitTests, @unchecked Sendable {
+      @Test(arguments: [false, true])
+      func successAndFreshEpoch(send: Bool) async throws {
+        try await scripted { _, _ in
+        } operation: {
+          let first = try await receipt(send)
+          #expect(first.result == .succeeded)
+          #expect(first.failures.isEmpty)
+          #expect(syncEngine.isValid(first.settlementToken))
+          let second = try await receipt(send)
+          #expect(second.result == .succeeded)
+          #expect(second.attemptID != first.attemptID)
+          #expect(!syncEngine.isValid(first.settlementToken))
+          try syncEngine.withSettlementLease(second.settlementToken) {}
+        }
+      }
+
+      @Test(arguments: [false, true], [CKDatabase.Scope.private, .shared])
+      func thrownTransportFailure(send: Bool, scope: CKDatabase.Scope) async throws {
+        let error = NSError(domain: "receipt-test", code: 42)
+        try await scripted { engine, _ in
+          if engine.database.databaseScope == scope { throw error }
+        } operation: {
+          let result = try await receipt(send)
+          #expect(result.result == .failed)
+          let failure = try #require(result.failures.first)
+          #expect(failure.attemptID == result.attemptID)
+          #expect(failure.error as NSError === error)
+          #expect(failure.context.databaseScope == scope)
+          #expect(failure.context.operationKind == (send ? .sendChanges : .fetchChanges))
+        }
+      }
+
+      @Test(arguments: [CKError.Code.networkFailure, .partialFailure, .zoneNotFound])
+      func zoneFetchErrorsAndDeduplicatedThrow(code: CKError.Code) async throws {
+        let error = CKError(code, userInfo: [CKErrorRetryAfterKey: 12])
+        let zone = CKRecordZone.ID(zoneName: "failed")
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .private else { return }
+          await engine.emit(.didFetchRecordZoneChanges(zoneID: zone, error: error))
+          throw error
+        } operation: {
+          let result = try await receipt(false)
+          #expect(result.result == .failed)
+          #expect(result.failures.count == 1)
+          let failure = try #require(result.failures.first)
+          #expect((failure.error as NSError).isEqual(error as NSError))
+          #expect(failure.context.zoneID == zone)
+          #expect(failure.context.operationKind == .fetchRecordZoneChanges)
+        }
+      }
+
+      @Test(arguments: [false, true])
+      func databaseSendErrors(deleting: Bool) async throws {
+        let zone = CKRecordZone(zoneName: "failed-send")
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .shared else { return }
+          await engine.emit(
+            .sentDatabaseChanges(
+              savedZones: [], failedZoneSaves: deleting ? [] : [(zone, CKError(.zoneBusy))],
+              deletedZoneIDs: [],
+              failedZoneDeletes: deleting ? [zone.zoneID: CKError(.zoneBusy)] : [:]
+            ))
+        } operation: {
+          let result = try await receipt(true)
+          #expect(result.result == .failed)
+          #expect(result.failures.count == 1)
+          #expect(result.failures.first?.context.operationKind == .sentDatabaseChanges)
+          #expect(result.failures.first?.context.databaseScope == .shared)
+          #expect(result.failures.first?.context.zoneID == zone.zoneID)
+        }
+      }
+
+      @Test(
+        arguments: [false, true],
+        [CKError.Code.networkFailure, .zoneNotFound, .serverRecordChanged])
+      func recordSendErrors(deleting: Bool, code: CKError.Code) async throws {
+        let record = CKRecord(
+          recordType: "remindersLists", recordID: RemindersList.recordID(for: 1))
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .private else { return }
+          await engine.emit(
+            .sentRecordZoneChanges(
+              savedRecords: [], failedRecordSaves: deleting ? [] : [(record, CKError(code))],
+              deletedRecordIDs: [],
+              failedRecordDeletes: deleting ? [record.recordID: CKError(code)] : [:]
+            ))
+        } operation: {
+          let result = try await receipt(true)
+          #expect(result.result == .failed)
+          #expect(result.failures.count == 1)
+          #expect(
+            result.failures.first?.context.operationKind
+              == (deleting ? .sentRecordDelete : .sentRecordSave))
+          #expect(result.failures.first?.attemptID == result.attemptID)
+        }
+        syncEngine.private.state.removePendingChanges()
+      }
+
+      @Test(arguments: ["application", "deletion", "zone"])
+      func fetchedApplicationErrors(kind: String) async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Local") }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let record = try syncEngine.private.database.record(for: RemindersList.recordID(for: 1))
+        record.setValue("Remote", forKey: "title", at: now + 1)
+        try await userDatabase.write { db in
+          try db.execute(
+            sql: """
+              CREATE TRIGGER receipt_failure BEFORE \(kind == "application" ? "UPDATE" : "DELETE")
+              ON remindersLists BEGIN SELECT RAISE(ABORT, 'receipt application failure'); END
+              """)
+        }
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .private else { return }
+          switch kind {
+          case "application":
+            await engine.emit(.fetchedRecordZoneChanges(modifications: [record], deletions: []))
+          case "deletion":
+            await engine.emit(
+              .fetchedRecordZoneChanges(
+                modifications: [], deletions: [(record.recordID, record.recordType)]))
+          default:
+            await engine.emit(
+              .fetchedDatabaseChanges(
+                modifications: [], deletions: [(record.recordID.zoneID, .deleted)]))
+          }
+        } operation: {
+          let check = {
+            let result = try await self.receipt(false)
+            #expect(result.result == .failed)
+            #expect(result.failures.count == 1)
+            #expect(result.failures.first?.attemptID == result.attemptID)
+            let operation: SyncEngineOperation =
+              kind == "application"
+              ? .fetchedRecordApplication
+              : kind == "deletion" ? .fetchedRecordDeletion : .zoneDeletion
+            #expect(result.failures.first?.context.operationKind == operation)
+          }
+          if kind == "application" {
+            try await check()
+          } else {
+            try await withKnownIssue {
+              try await check()
+            } matching: {
+              $0.description.contains("receipt application failure")
+            }
+          }
+        }
+        syncEngine.private.state.removePendingChanges()
+      }
+
+      @Test
+      func assetReadFailureKeepsEpochThroughWriter() async throws {
+        let parent = CKRecord(
+          recordType: RemindersList.tableName, recordID: RemindersList.recordID(for: 1))
+        parent.setValue(1, forKey: "id", at: now)
+        parent.setValue("Parent", forKey: "title", at: now)
+        let record = CKRecord(
+          recordType: RemindersListAsset.tableName, recordID: RemindersListAsset.recordID(for: 1))
+        record.setValue(1, forKey: "remindersListID", at: now)
+        record.setAsset(
+          CKAsset(fileURL: URL(fileURLWithPath: "/missing-receipt-asset")), forKey: "coverImage",
+          at: now)
+        try await scripted { engine, _ in
+          if engine.database.databaseScope == .private {
+            await engine.emit(
+              .fetchedRecordZoneChanges(modifications: [parent, record], deletions: []))
+          }
+        } operation: {
+          let result = try await receipt(false)
+          #expect(result.result == .failed)
+          #expect(result.failures.count >= 1)
+          #expect(result.failures.allSatisfy { $0.attemptID == result.attemptID })
+        }
+      }
+
+      @Test
+      func foreignKeyDeferralIsFailure() async throws {
+        let record = CKRecord(recordType: Reminder.tableName, recordID: Reminder.recordID(for: 1))
+        record.setValue(1, forKey: "id", at: now)
+        record.setValue("Orphan", forKey: "title", at: now)
+        record.setValue(999, forKey: "remindersListID", at: now)
+        try await scripted { engine, _ in
+          if engine.database.databaseScope == .private {
+            await engine.emit(.fetchedRecordZoneChanges(modifications: [record], deletions: []))
+          }
+        } operation: {
+          let result = try await receipt(false)
+          #expect(result.result == .failed)
+          #expect(result.failures.contains { $0.context.disposition == .transientPendingRetry })
+          #expect(result.failures.allSatisfy { $0.attemptID == result.attemptID })
+        }
+      }
+
+      @Test
+      func sendPersistenceFailure() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Local") }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let record = try syncEngine.private.database.record(for: RemindersList.recordID(for: 1))
+        try await syncEngine.metadatabase.write { db in
+          try db.execute(
+            sql: """
+              CREATE TRIGGER receipt_metadata_failure BEFORE UPDATE ON sqlitedata_icloud_metadata
+              BEGIN SELECT RAISE(ABORT, 'receipt metadata failure'); END
+              """)
+        }
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .private else { return }
+          await engine.emit(
+            .sentRecordZoneChanges(
+              savedRecords: [record], failedRecordSaves: [], deletedRecordIDs: [],
+              failedRecordDeletes: [:]))
+        } operation: {
+          try await withKnownIssue {
+            let result = try await receipt(true)
+            #expect(result.result == .failed)
+            #expect(result.failures.count == 1)
+            #expect(
+              String(describing: result.failures[0].error).contains("receipt metadata failure"))
+          } matching: {
+            $0.description.contains("receipt metadata failure")
+          }
+        }
+      }
+
+      @Test($syncEngineDelegate.set(ReceiptSuspendedDelegate()))
+      func awaitedOriginalReportAndOverlap() async throws {
+        let delegate = try #require(syncEngineDelegate as? ReceiptSuspendedDelegate)
+        let eventTask = LockIsolated<Task<Void, Never>?>(nil)
+        let calls = LockIsolated(0)
+        try await scripted { engine, _ in
+          guard engine.database.databaseScope == .private else { return }
+          let call = calls.withValue {
+            $0 += 1
+            return $0
+          }
+          if call == 1 {
+            eventTask.setValue(
+              Task {
+                await engine.emit(
+                  .didFetchRecordZoneChanges(
+                    zoneID: CKRecordZone.ID(zoneName: "late"), error: CKError(.networkFailure)))
+              })
+            await delegate.entered.wait()
+            throw CKError(.networkFailure)
+          }
+        } operation: {
+          let done = LockIsolated(false)
+          let first = Task {
+            let result = try await receipt(false)
+            done.setValue(true)
+            return result
+          }
+          await delegate.entered.wait()
+          #expect(!done.value)
+          let secondStarted = ReceiptLatch()
+          let second = Task {
+            secondStarted.signal()
+            return try await receipt(false)
+          }
+          await secondStarted.wait()
+          // Wait until the second explicit private operation actually runs, without timing sleeps.
+          while calls.value < 2 { await Task.yield() }
+          #expect(!done.value)
+          delegate.release.signal()
+          let old = try await first.value
+          let new = try await second.value
+          #expect(old.result == .failed)
+          #expect(old.failures.count == 1)
+          #expect(new.result == .unconfirmed)
+          #expect(new.failures.isEmpty)
+          await eventTask.value?.value
+          let clean = try await receipt(false)
+          #expect(clean.result == .succeeded)
+          #expect(clean.failures.isEmpty)
+        }
+      }
+
+      @Test(arguments: [false, true])
+      func cancellationNeverSucceeds(send: Bool) async throws {
+        try await scripted { engine, _ in
+          if engine.database.databaseScope == .private { throw CancellationError() }
+        } operation: {
+          await #expect(throws: CancellationError.self) { try await receipt(send) }
+        }
+      }
+
+      @Test($syncEngineDelegate.set(ErrorReportingDelegate()))
+      func accountChangeWithoutRestartNeverSucceeds() async throws {
+        await scripted { engine, _ in
+          if engine.database.databaseScope == .private {
+            await engine.emit(
+              .accountChange(changeType: .signOut(previousUser: CKRecord.ID(recordName: "old"))))
+          }
+        } operation: {
+          await #expect(throws: CancellationError.self) { try await receipt(false) }
+        }
+      }
+
+      @Test($syncEngineDelegate.set(ReceiptFailureDelegate()))
+      func automaticFailuresKeepEpochAcrossSuspendedReport() async throws {
+        let delegate = try #require(syncEngineDelegate as? ReceiptFailureDelegate)
+        let engine = syncEngine.private
+        let zone = CKRecordZone.ID(zoneName: "automatic")
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
+        let oldEvent = Task {
+          await syncEngine.handleEvent(
+            .didFetchRecordZoneChanges(zoneID: zone, error: CKError(.networkFailure)),
+            syncEngine: engine)
+        }
+        await delegate.entered.wait()
+        let oldID = try #require(delegate.failures.value.first?.attemptID)
+        await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
+        await syncEngine.handleEvent(
+          .didFetchRecordZoneChanges(zoneID: zone, error: CKError(.zoneBusy)), syncEngine: engine)
+        await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
+        let newID = try #require(delegate.failures.value.last?.attemptID)
+        #expect(newID != oldID)
+        let done = LockIsolated(false)
+        let admitted = ReceiptLatch()
+        let receiptTask = Task {
+          try await scripted { engine, _ in
+            if engine.database.databaseScope == .private { admitted.signal() }
+          } operation: {
+            let result = try await receipt(false)
+            #expect(result.result == .unconfirmed)
+            #expect(result.failures.isEmpty)
+            done.setValue(true)
+          }
+        }
+        // The failure delegate itself remains admitted work until it returns.
+        await admitted.wait()
+        #expect(!done.value)
+        delegate.release.signal()
+        await oldEvent.value
+        try await receiptTask.value
+        #expect(delegate.failures.value.first?.attemptID == oldID)
+      }
+
+      @Test($syncEngineDelegate.set(ReceiptFailureDelegate(blockFirst: false)))
+      func automaticSendFailureUsesStableEpoch() async throws {
+        let delegate = try #require(syncEngineDelegate as? ReceiptFailureDelegate)
+        let zone = CKRecordZone(zoneName: "automatic-send")
+        for _ in 0..<2 {
+          await syncEngine.handleEvent(
+            .sentDatabaseChanges(
+              savedZones: [], failedZoneSaves: [(zone, CKError(.zoneBusy))],
+              deletedZoneIDs: [], failedZoneDeletes: [:]), syncEngine: syncEngine.private)
+        }
+        #expect(delegate.failures.value.count == 2)
+        #expect(delegate.failures.value[0].attemptID == delegate.failures.value[1].attemptID)
+        #expect(
+          delegate.failures.value.allSatisfy { $0.context.operationKind == .sentDatabaseChanges })
+      }
+
+      private func receipt(_ send: Bool) async throws -> SyncEngine.AttemptReceipt {
+        if send { return try await syncEngine.sendChangesWithReceipt() }
+        return try await syncEngine.fetchChangesWithReceipt()
+      }
+
+      private func scripted(
+        _ action: @escaping ReceiptEngine.Action,
+        operation: () async throws -> Void
+      ) async rethrows {
+        let original = syncEngine.syncEngines.withValue { engines in
+          let original = engines
+          engines = SyncEngines(
+            private: ReceiptEngine(base: engines.private as! MockSyncEngine, action: action),
+            shared: ReceiptEngine(base: engines.shared as! MockSyncEngine, action: action))
+          return original
+        }
+        defer { syncEngine.syncEngines.withValue { engines in engines = original } }
+        try await operation()
+      }
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private final class ReceiptEngine: SyncEngineProtocol {
+    typealias Action = @Sendable (ReceiptEngine, Bool) async throws -> Void
+    let base: MockSyncEngine
+    let action: Action
+    var database: MockCloudDatabase { base.database }
+    var state: MockSyncEngineState { base.state }
+    init(base: MockSyncEngine, action: @escaping Action) {
+      self.base = base
+      self.action = action
+    }
+    func fetchChanges(_ options: CKSyncEngine.FetchChangesOptions) async throws {
+      try await action(self, false)
+    }
+    func sendChanges(_ options: CKSyncEngine.SendChangesOptions) async throws {
+      try await action(self, true)
+    }
+    func cancelOperations() async {}
+    func emit(_ event: SyncEngine.Event) async {
+      await base.parentSyncEngine.handleEvent(event, syncEngine: self)
+    }
+    func recordZoneChangeBatch(
+      pendingChanges: [CKSyncEngine.PendingRecordZoneChange],
+      recordProvider: @Sendable (CKRecord.ID) async -> CKRecord?
+    ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+      await base.recordZoneChangeBatch(
+        pendingChanges: pendingChanges, recordProvider: recordProvider)
+    }
+  }
+
+  private final class ReceiptLatch: Sendable {
+    private let state = LockIsolated(
+      (signaled: false, waiters: [CheckedContinuation<Void, Never>]()))
+    func wait() async {
+      await withCheckedContinuation { continuation in
+        state.withValue {
+          if $0.signaled { continuation.resume() } else { $0.waiters.append(continuation) }
+        }
+      }
+    }
+    func signal() {
+      state.withValue {
+        $0.signaled = true
+        for waiter in $0.waiters { waiter.resume() }
+        $0.waiters.removeAll()
+      }
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private final class ReceiptFailureDelegate: SyncEngineDelegate {
+    let failures = LockIsolated<[SyncEngine.AttemptReceipt.Failure]>([])
+    let entered = ReceiptLatch()
+    let release = ReceiptLatch()
+    let blockFirst: Bool
+    init(blockFirst: Bool = true) { self.blockFirst = blockFirst }
+    func syncEngine(
+      _ syncEngine: SyncEngine, didReportFailure failure: SyncEngine.AttemptReceipt.Failure
+    ) async {
+      let count = failures.withValue {
+        $0.append(failure)
+        return $0.count
+      }
+      if count == 1 && blockFirst {
+        entered.signal()
+        await release.wait()
+      }
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private final class ReceiptSuspendedDelegate: SyncEngineDelegate {
+    let entered = ReceiptLatch()
+    let release = ReceiptLatch()
+    func syncEngine(
+      _ syncEngine: SyncEngine, didReportError error: any Error, context: SyncEngineErrorContext
+    ) async {
+      entered.signal()
+      await release.wait()
+    }
+  }
+#endif

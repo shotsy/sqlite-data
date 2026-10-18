@@ -8,6 +8,10 @@
   public enum SyncEngineOperation: String, Sendable, Equatable {
     /// An explicit fetch of remote changes threw an error.
     case fetchChanges = "fetchChanges"
+    /// An explicit send of local changes threw an error.
+    case sendChanges = "sendChanges"
+    /// CloudKit failed to save or delete a database zone.
+    case sentDatabaseChanges = "sentDatabaseChanges"
     /// A CloudKit record-zone download completed with an error.
     case fetchRecordZoneChanges = "didFetchRecordZoneChanges"
     /// A locally-changed record failed to save to CloudKit.
@@ -273,6 +277,15 @@
       context: SyncEngineErrorContext
     ) async
 
+    /// An epoch-bound failure observation, including standalone automatic fetch/send cycles.
+    /// Awaited outside database writers; the default is a no-op. Automatic epochs are conservative
+    /// lifecycle windows, not unique CloudKit request IDs. Overlap may report a failure for multiple
+    /// epochs. Captured callbacks retain their original epoch across awaits and lifecycle endings.
+    /// There is no automatic success callback; use the explicit receipt APIs for settled success.
+    func syncEngine(
+      _ syncEngine: SyncEngine, didReportFailure failure: SyncEngine.AttemptReceipt.Failure)
+      async
+
     /// Capture app identity without suspension. Return nil when identity/coverage is unavailable.
     /// Called before async transfer work; implementations must not call back into this engine.
     func syncEngine(
@@ -312,6 +325,10 @@
       _ syncEngine: SyncEngine,
       didReportError error: any Error,
       context: SyncEngineErrorContext
+    ) async {}
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine, didReportFailure failure: SyncEngine.AttemptReceipt.Failure
     ) async {}
 
     public func syncEngine(
