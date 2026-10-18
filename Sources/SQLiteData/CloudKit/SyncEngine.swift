@@ -36,6 +36,10 @@
     package let settlement = SyncSettlement()
     let attempts = SyncAttempts()
     let retirementUploads = RetirementUploads()
+    // Account ownership is independent of stop/start lifetimes. Only reset advances it,
+    // on the user writer; validation and mutations must share that same writer turn.
+    // Never acquire settlement from the writer: a lease consumer can be waiting on it.
+    private let accountGeneration = LockIsolated(UUID())
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -45,7 +49,8 @@
     let dataManager = Dependency(\.dataManager)
     private let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
-    private let startTask = LockIsolated<Task<Void, Never>?>(nil)
+    // Internal for tests that must exercise account fencing independently of task cancellation.
+    let startTask = LockIsolated<Task<Void, Never>?>(nil)
     // Attempt-local bookkeeping only: engine identity isolates private/shared and replaced
     // engines; UUIDs prevent a later request from inheriting an earlier request's errors.
     // Entries live until the explicit fetch returns, not until the activity flag becomes idle.
@@ -617,6 +622,8 @@
     }
 
     private func start() throws -> Task<Void, Never> {
+      // Capture at origination, before any cached schema or record can be read.
+      let accountGeneration = self.accountGeneration.value
       guard !isRunning else { return Task {} }
       let lifetime: UUID? = observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         settlement.withAdmission {
@@ -708,19 +715,25 @@
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           guard try await container.accountStatus() == .available
           else { return }
-          syncEngines.withValue {
-            $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
+          try await userDatabase.write { _ in
+            guard self.accountGeneration.value == accountGeneration else { return }
+            syncEngines.withValue {
+              $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
+            }
           }
           try await uploadRecordsToCloudKit(
             previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
+            currentRecordTypeByTableName: currentRecordTypeByTableName,
+            accountGeneration: accountGeneration
           )
           try await updateLocalFromSchemaChange(
             previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
+            currentRecordTypeByTableName: currentRecordTypeByTableName,
+            accountGeneration: accountGeneration
           )
-          try await cacheUserTables(recordTypes: currentRecordTypes)
-          await scheduleDurableRecordZoneFailureRetries()
+          try await cacheUserTables(
+            recordTypes: currentRecordTypes, accountGeneration: accountGeneration)
+          await scheduleDurableRecordZoneFailureRetries(accountGeneration: accountGeneration)
         }
       }
       handedOff = true
@@ -924,8 +937,9 @@
       try await fetchChanges(fetchOptions)
     }
 
-    private func cacheUserTables(recordTypes: [RecordType]) async throws {
+    private func cacheUserTables(recordTypes: [RecordType], accountGeneration: UUID) async throws {
       try await userDatabase.write { db in
+        guard self.accountGeneration.value == accountGeneration else { return }
         try RecordType
           .upsert { recordTypes.map { RecordType.Draft($0) } }
           .execute(db)
@@ -934,10 +948,12 @@
 
     private func uploadRecordsToCloudKit(
       previousRecordTypeByTableName: [String: RecordType],
-      currentRecordTypeByTableName: [String: RecordType]
+      currentRecordTypeByTableName: [String: RecordType],
+      accountGeneration: UUID
     ) async throws {
-      try await enqueueLocallyPendingChanges()
+      try await enqueueLocallyPendingChanges(accountGeneration: accountGeneration)
       try await userDatabase.write { db in
+        guard self.accountGeneration.value == accountGeneration else { return }
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
           previousRecordTypeByTableName[tableName] == nil
         }
@@ -968,9 +984,10 @@
       }
     }
 
-    private func enqueueLocallyPendingChanges() async throws {
+    private func enqueueLocallyPendingChanges(accountGeneration: UUID) async throws {
       let engines = syncEngines.withValue { $0 }
       try await userDatabase.write { db in
+        guard self.accountGeneration.value == accountGeneration else { return }
         let changes = try PendingRecordZoneChange.select(\.pendingRecordZoneChange).fetchAll(db)
         let handedOff = syncEngines.withValue { current in
           guard current.isRunning, current.private === engines.private,
@@ -1029,7 +1046,8 @@
 
     private func updateLocalFromSchemaChange(
       previousRecordTypeByTableName: [String: RecordType],
-      currentRecordTypeByTableName: [String: RecordType]
+      currentRecordTypeByTableName: [String: RecordType],
+      accountGeneration: UUID
     ) async throws {
       let tablesWithChangedSchemas = currentRecordTypeByTableName.filter { tableName, recordType in
         previousRecordTypeByTableName[tableName]?.schema != recordType.schema
@@ -1058,6 +1076,7 @@
               changedColumnNames: changedColumns
             )
             try await userDatabase.write { db in
+              guard self.accountGeneration.value == accountGeneration else { return }
               try #sql(query).execute(db)
             }
           }
@@ -1068,6 +1087,7 @@
 
     package func tearDownSyncEngine() throws {
       try userDatabase.write { db in
+        accountGeneration.setValue(UUID())
         retirementUploads.invalidate()
         for table in tables.reversed() {
           try table.base
@@ -2390,7 +2410,9 @@
       }
     }
 
-    private func scheduleDurableRecordZoneFailureRetry(_ failure: DurableRecordZoneFailure) {
+    private func scheduleDurableRecordZoneFailureRetry(
+      _ failure: DurableRecordZoneFailure, accountGeneration: UUID? = nil
+    ) {
       guard !failure.isTerminal else { return }
       let exponent = min(max(failure.attemptCount - 1, 0), 5)
       let delay = min(30 * pow(2, Double(exponent)), 900)
@@ -2413,15 +2435,27 @@
           currentFailure.action == DurableRecordZoneFailure.deleteAction
           ? .deleteRecord(currentFailure.recordID)
           : .saveRecord(currentFailure.recordID)
-        self.syncEngines.withValue {
-          let engine =
-            currentFailure.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-          engine?.state.add(pendingRecordZoneChanges: [change])
+        @Sendable func enqueue() {
+          self.syncEngines.withValue {
+            let engine =
+              currentFailure.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
+            engine?.state.add(pendingRecordZoneChanges: [change])
+          }
+        }
+        if let accountGeneration {
+          await withErrorReporting(.sqliteDataCloudKitFailure) {
+            try await self.userDatabase.write { _ in
+              guard self.accountGeneration.value == accountGeneration else { return }
+              enqueue()
+            }
+          }
+        } else {
+          enqueue()
         }
       }
     }
 
-    private func scheduleDurableRecordZoneFailureRetries() async {
+    private func scheduleDurableRecordZoneFailureRetries(accountGeneration: UUID) async {
       let failures =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await metadatabase.read { db in
@@ -2430,7 +2464,7 @@
         }
         ?? []
       for failure in failures {
-        scheduleDurableRecordZoneFailureRetry(failure)
+        scheduleDurableRecordZoneFailureRetry(failure, accountGeneration: accountGeneration)
       }
     }
 
