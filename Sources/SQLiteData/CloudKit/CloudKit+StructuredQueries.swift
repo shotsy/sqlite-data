@@ -197,6 +197,17 @@
       forKey key: CKRecord.FieldKey,
       at userModificationTime: Int64
     ) -> Bool {
+      withErrorReporting(.sqliteDataCloudKitFailure) {
+        try setBytesThrowing(newValue, forKey: key, at: userModificationTime)
+      } ?? false
+    }
+
+    @discardableResult
+    private func setBytesThrowing(
+      _ newValue: [UInt8],
+      forKey key: CKRecord.FieldKey,
+      at userModificationTime: Int64
+    ) throws -> Bool {
       guard encryptedValues[at: key] <= userModificationTime
       else { return false }
 
@@ -209,15 +220,12 @@
           .joined()
       )
       let asset = CKAsset(fileURL: fileURL)
-      return withErrorReporting(.sqliteDataCloudKitFailure) {
-        try dataManager.save(Data(newValue), to: fileURL)
-        self[key] = asset
-        encryptedValues[at: key] = userModificationTime
-        encryptedValues[hash: key] = hash
-        self.userModificationTime = userModificationTime
-        return true
-      }
-        ?? false
+      try dataManager.save(Data(newValue), to: fileURL)
+      self[key] = asset
+      encryptedValues[at: key] = userModificationTime
+      encryptedValues[hash: key] = hash
+      self.userModificationTime = userModificationTime
+      return true
     }
 
     @discardableResult
@@ -246,15 +254,27 @@
       return false
     }
 
-    func update<T: PrimaryKeyedTable>(with row: T, userModificationTime: Int64) {
+    func update<T: PrimaryKeyedTable>(
+      with row: T,
+      userModificationTime: Int64,
+      onError: (any Error) throws -> Void = { error in
+        withErrorReporting(.sqliteDataCloudKitFailure) { throw error }
+      }
+    ) rethrows {
       for column in T.TableColumns.writableColumns {
-        func open<Root, Value>(_ column: some WritableTableColumnExpression<Root, Value>) {
+        func open<Root, Value>(
+          _ column: some WritableTableColumnExpression<Root, Value>
+        ) throws {
           let keyPath = column.keyPath as! KeyPath<T, Value.QueryOutput>
           let column = column as! any WritableTableColumnExpression<T, Value>
           let value = Value(queryOutput: row[keyPath: keyPath])
           switch value.queryBinding {
           case .blob(let value):
-            setBytes(value, forKey: column.name, at: userModificationTime)
+            do {
+              try setBytesThrowing(value, forKey: column.name, at: userModificationTime)
+            } catch {
+              try onError(error)
+            }
           case .bool(let value):
             setValue(value, forKey: column.name, at: userModificationTime)
           case .double(let value):
@@ -279,7 +299,7 @@
             reportIssue(error)
           }
         }
-        open(column)
+        try open(column)
       }
     }
 

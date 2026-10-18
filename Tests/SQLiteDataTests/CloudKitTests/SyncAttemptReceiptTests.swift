@@ -1,6 +1,8 @@
 #if canImport(CloudKit)
   import CloudKit
   import ConcurrencyExtras
+  import Dependencies
+  import GRDB
   @testable import SQLiteData
   import Testing
   import TestLocals
@@ -160,6 +162,94 @@
           }
         }
         syncEngine.private.state.removePendingChanges()
+      }
+
+      @Test(arguments: [false, true])
+      func outgoingAssetStagingFailureKeepsSaveRetryable(previouslyUploaded: Bool) async throws {
+        let recordID = RemindersListAsset.recordID(for: 1)
+        let originalBytes = Data([1, 2, 3])
+        let editedBytes = Data([4, 5, 6])
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Parent") }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersListAsset(remindersListID: 1, coverImage: originalBytes)
+          }
+        }
+        if previouslyUploaded {
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+          try await userDatabase.userWrite { db in
+            try RemindersListAsset.find(1).update { $0.coverImage = #bind(editedBytes) }.execute(db)
+          }
+        }
+        let baseline = try await syncEngine.metadatabase.read { db -> [Data?] in
+          let row = try #require(
+            try Row.fetchOne(
+              db,
+              sql: """
+                SELECT lastKnownServerRecord, _lastKnownServerRecordAllFields
+                FROM sqlitedata_icloud_metadata WHERE recordType = ?
+                """,
+              arguments: [RemindersListAsset.tableName]))
+          return [row[0], row[1]]
+        }
+        let error = NSError(domain: "receipt-asset-staging", code: 28)
+        let failingDataManager = ReceiptFailingDataManager(base: inMemoryDataManager, error: error)
+        let uploadedCount = LockIsolated(0)
+        try await scripted { engine, send in
+          #expect(send)
+          guard engine.database.databaseScope == .private else { return }
+          let batch = try #require(
+            await engine.base.parentSyncEngine.nextRecordZoneChangeBatch(syncEngine: engine))
+          uploadedCount.withValue { $0 += batch.recordsToSave.count }
+          let results = try engine.database.modifyRecords(saving: batch.recordsToSave)
+          let savedRecords = try results.saveResults.values.map { try $0.get() }
+          await engine.emit(
+            .sentRecordZoneChanges(
+              savedRecords: savedRecords, failedRecordSaves: [], deletedRecordIDs: [],
+              failedRecordDeletes: [:]))
+        } operation: {
+          let result = try await withDependencies {
+            $0.dataManager = failingDataManager
+          } operation: {
+            try await receipt(true)
+          }
+          #expect(result.result == .failed)
+          #expect(result.failures.count == 1)
+          let failure = try #require(result.failures.first)
+          #expect(failure.attemptID == result.attemptID)
+          #expect(failure.error as NSError === error)
+          #expect(failure.context.operation == "sendChanges")
+          #expect(failure.context.operationKind == nil)
+          #expect(failure.context.databaseScope == .private)
+          #expect(failure.context.zoneID == recordID.zoneID)
+          #expect(failure.context.recordType == RemindersListAsset.tableName)
+          #expect(failure.context.isLocalSaveFailure)
+        }
+        #expect(failingDataManager.saveAttempts.value == 1)
+        #expect(uploadedCount.value == 0)
+        #expect(syncEngine.private.state.pendingRecordZoneChanges == [.saveRecord(recordID)])
+        let afterFailure = try await syncEngine.metadatabase.read { db -> [Data?] in
+          let row = try #require(
+            try Row.fetchOne(
+              db,
+              sql: """
+                SELECT lastKnownServerRecord, _lastKnownServerRecordAllFields
+                FROM sqlitedata_icloud_metadata WHERE recordType = ?
+                """,
+              arguments: [RemindersListAsset.tableName]))
+          return [row[0], row[1]]
+        }
+        #expect(afterFailure == baseline)
+        // A healthy retry must stage and upload the edited bytes, not the stale asset.
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        let uploaded = try syncEngine.private.database.record(for: recordID)
+        let asset = try #require(uploaded["coverImage"] as? CKAsset)
+        let url = try #require(asset.fileURL)
+        #expect(try dataManager.load(url) == (previouslyUploaded ? editedBytes : originalBytes))
+        syncEngine.private.state.assertPendingRecordZoneChanges([])
       }
 
       @Test
@@ -438,6 +528,19 @@
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
       await base.recordZoneChangeBatch(
         pendingChanges: pendingChanges, recordProvider: recordProvider)
+    }
+  }
+
+  private struct ReceiptFailingDataManager: DataManager {
+    let base: InMemoryDataManager
+    let error: NSError
+    let saveAttempts = LockIsolated(0)
+    var temporaryDirectory: URL { base.temporaryDirectory }
+    func load(_ url: URL) throws -> Data { try base.load(url) }
+    func sha256(of fileURL: URL) -> Data? { base.sha256(of: fileURL) }
+    func save(_ data: Data, to url: URL) throws {
+      saveAttempts.withValue { $0 += 1 }
+      throw error
     }
   }
 
