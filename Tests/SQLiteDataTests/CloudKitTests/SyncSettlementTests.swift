@@ -1,6 +1,7 @@
 #if canImport(CloudKit)
   import CloudKit
   import ConcurrencyExtras
+  import Foundation
   @testable import SQLiteData
   import Testing
 
@@ -121,6 +122,80 @@
           _ = try await syncEngine.waitForSettlement()
           syncEngine.stop()
         }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: ["event", "account", "stop"])
+      func leaseExcludesConcurrentInvalidation(_ kind: String) async throws {
+        let token = try await syncEngine.waitForSettlement()
+        let engine = syncEngine.private
+        let entered = SettlementLatch()
+        let release = DispatchSemaphore(value: 0)
+        let attempted = DispatchSemaphore(value: 0)
+        let completed = DispatchSemaphore(value: 0)
+        let result = LockIsolated<Result<Int, any Error>?>(nil)
+        let leaseFinished = SettlementLatch()
+        // Use a real thread: other suites temporarily install the main serial executor globally.
+        DispatchQueue.global().async { [syncEngine] in
+          result.setValue(Result {
+            try syncEngine.withSettlementLease(token) {
+              entered.signal()
+              #expect(release.wait(timeout: .now() + 5) == .success)
+              return 42
+            }
+          })
+          leaseFinished.signal()
+        }
+        await entered.wait()
+        DispatchQueue.global().async {
+          #expect(attempted.wait(timeout: .now() + 5) == .success)
+          #expect(completed.wait(timeout: .now() + 0.05) == .timedOut)
+          release.signal()
+        }
+        let event = Task { [syncEngine] in
+          attempted.signal()
+          switch kind {
+          case "stop": syncEngine.stop()
+          case "account":
+            await syncEngine.handleEvent(
+              .accountChange(changeType: .signIn(currentUser: CKRecord.ID(recordName: "user"))),
+              syncEngine: engine
+            )
+          default:
+            await syncEngine.handleEvent(.willFetchChanges, syncEngine: engine)
+          }
+          completed.signal()
+        }
+        await leaseFinished.wait()
+        #expect(try result.value?.get() == 42)
+        await event.value
+        #expect(!syncEngine.isValid(token))
+        if kind == "account" {
+          try await syncEngine.processPendingDatabaseChanges(scope: .private)
+        }
+        if kind == "event" {
+          // The blocked event was delivered, not discarded by the lease.
+          #expect(syncEngine.isFetchingChanges)
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: engine)
+          _ = try await syncEngine.waitForSettlement()
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func throwingConsumerReleasesLeaseAndPropagatesError() async throws {
+        struct ConsumerFailure: Error, Equatable { let value: Int }
+        let token = try await syncEngine.waitForSettlement()
+        #expect(throws: ConsumerFailure(value: 42)) {
+          try syncEngine.withSettlementLease(token) { throw ConsumerFailure(value: 42) }
+        }
+        #expect(try syncEngine.withSettlementLease(token) { "retry" } == "retry")
+        await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+        let invoked = LockIsolated(false)
+        #expect(throws: CancellationError.self) {
+          try syncEngine.withSettlementLease(token) { invoked.setValue(true) }
+        }
+        #expect(!invoked.value)
+        await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
