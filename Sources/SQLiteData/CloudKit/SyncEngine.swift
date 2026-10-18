@@ -35,6 +35,7 @@
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
     package let settlement = SyncSettlement()
     let attempts = SyncAttempts()
+    let retirementUploads = RetirementUploads()
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -628,6 +629,7 @@
               private: privateSyncEngine,
               shared: sharedSyncEngine
             )
+            retirementUploads.register($0)
             return lifetime
           }
         }
@@ -936,8 +938,6 @@
     ) async throws {
       try await enqueueLocallyPendingChanges()
       try await userDatabase.write { db in
-        try PendingRecordZoneChange.delete().execute(db)
-
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
           previousRecordTypeByTableName[tableName] == nil
         }
@@ -950,23 +950,47 @@
       }
     }
 
+    // Capture retained engines after retirement admission closes and admitted work quiesces.
+    // This helper deliberately does not change stop() or lifecycle/settlement semantics.
+    func captureRetirementUploads(engines: SyncEngines? = nil) -> RetirementUploads.Snapshot {
+      syncEngines.withValue { retirementUploads.capture(engines ?? $0) }
+    }
+
+    func persistRetirementUploads(_ snapshot: RetirementUploads.Snapshot) async throws {
+      try await userDatabase.write { db in
+        try retirementUploads.validate(snapshot)
+        guard !snapshot.persisted.value else { return }
+        try PendingRecordZoneChange.insert {
+          snapshot.changes.map { PendingRecordZoneChange($0) }
+        }.execute(db)
+        // A failed statement OR commit leaves the snapshot retryable.
+        db.afterNextTransaction { _ in snapshot.persisted.setValue(true) }
+      }
+    }
+
     private func enqueueLocallyPendingChanges() async throws {
-      let pendingRecordZoneChanges = try await metadatabase.read { db in
-        try PendingRecordZoneChange
-          .select(\.pendingRecordZoneChange)
-          .fetchAll(db)
-      }
-      let changesByIsPrivate = Dictionary(grouping: pendingRecordZoneChanges) {
-        switch $0 {
-        case .deleteRecord(let recordID), .saveRecord(let recordID):
-          recordID.zoneID.ownerName == CKCurrentUserDefaultName
-        @unknown default:
-          false
+      let engines = syncEngines.withValue { $0 }
+      try await userDatabase.write { db in
+        let changes = try PendingRecordZoneChange.select(\.pendingRecordZoneChange).fetchAll(db)
+        let handedOff = syncEngines.withValue { current in
+          guard current.isRunning, current.private === engines.private,
+            current.shared === engines.shared
+          else { return false }
+          let grouped = Dictionary(grouping: changes) {
+            switch $0 {
+            case .deleteRecord(let id), .saveRecord(let id):
+              id.zoneID.ownerName == CKCurrentUserDefaultName
+            @unknown default:
+              false
+            }
+          }
+          engines.private?.state.add(pendingRecordZoneChanges: grouped[true] ?? [])
+          engines.shared?.state.add(pendingRecordZoneChanges: grouped[false] ?? [])
+          return true
         }
-      }
-      syncEngines.withValue {
-        $0.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
-        $0.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+        // Read/delete on one writer: a concurrent persistence tail cannot be erased by startup.
+        // Failure rolls back the journal deletion; replay into the SDK is idempotent.
+        if handedOff { try PendingRecordZoneChange.delete().execute(db) }
       }
     }
 
@@ -1044,6 +1068,7 @@
 
     package func tearDownSyncEngine() throws {
       try userDatabase.write { db in
+        retirementUploads.invalidate()
         for table in tables.reversed() {
           try table.base
             .dropTriggers(defaultZone: defaultZone, privateTables: privateTables, db: db)
@@ -1489,7 +1514,9 @@
       reason: CKSyncEngine.SyncReason, options: CKSyncEngine.SendChangesOptions,
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+      guard !retirementUploads.isRetired(syncEngine) else { return nil }
       var changes = await pendingRecordZoneChanges(options: options, syncEngine: syncEngine)
+      guard retirementUploads.begin(changes, engine: syncEngine) else { return nil }
       guard !changes.isEmpty
       else { return nil }
 
@@ -2414,6 +2441,13 @@
       failedRecordDeletes: [CKRecord.ID: CKError] = [:],
       syncEngine: any SyncEngineProtocol
     ) async {
+      // Explicit retirement already preserved both the queued and consumed intent. Late SDK
+      // results must not mutate the replacement account or re-enqueue an obsolete snapshot.
+      guard !retirementUploads.isRetired(syncEngine) else { return }
+      var settledUploads = savedRecords.map {
+        CKSyncEngine.PendingRecordZoneChange.saveRecord($0.recordID)
+      } + deletedRecordIDs.map { .deleteRecord($0) }
+      defer { retirementUploads.acknowledge(settledUploads, engine: syncEngine) }
       let window = transfer(syncEngine, upload: true)
       window?.state.withValue {
         $0.active += 1
@@ -2438,6 +2472,10 @@
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
       for (failedRecord, error) in failedRecordSaves {
+        var preserveIntent = false
+        defer {
+          if !preserveIntent { settledUploads.append(.saveRecord(failedRecord.recordID)) }
+        }
         recordAttemptFailure(
           error,
           context: SyncEngineErrorContext(
@@ -2469,13 +2507,15 @@
 
         @discardableResult
         func persistLocalSaveFailure(isTerminal: Bool) async -> DurableRecordZoneFailure? {
-          await persistDurableRecordZoneFailure(
+          let failure = await persistDurableRecordZoneFailure(
             recordID: failedRecord.recordID,
             action: DurableRecordZoneFailure.saveAction,
             recordType: failedRecord.recordType,
             error: error,
             isTerminal: isTerminal
           )
+          if failure == nil { preserveIntent = true }
+          return failure
         }
 
         func clearServerRecord() async {
@@ -2492,7 +2532,10 @@
         switch error.code {
         case .serverRecordChanged:
           guard let serverRecord = error.serverRecord
-          else { continue }
+          else {
+            preserveIntent = true
+            continue
+          }
           do {
             try await upsertFromServerRecord(serverRecord)
             newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
@@ -2787,6 +2830,7 @@
           }
         }
       if let failedDeleteHandling {
+        settledUploads += failedRecordDeletes.keys.map { .deleteRecord($0) }
         syncEngine.state.remove(pendingRecordZoneChanges: failedDeleteHandling.3)
         syncEngine.state.add(pendingRecordZoneChanges: failedDeleteHandling.2)
         for failure in failedDeleteHandling.4 {
