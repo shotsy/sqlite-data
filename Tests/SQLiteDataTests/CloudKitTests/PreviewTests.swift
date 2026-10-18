@@ -18,6 +18,7 @@
           }
         }
         await testClock.advance(by: .seconds(1))
+        _ = try await syncEngine.waitForSettlement()
         assertInlineSnapshot(of: container, as: .customDump) {
           """
           MockCloudContainer(
@@ -54,6 +55,7 @@
         }
 
         await testClock.advance(by: .seconds(1))
+        _ = try await syncEngine.waitForSettlement()
         try await $remindersLists.load()
         #expect(remindersLists.count == 1)
         assertInlineSnapshot(of: container, as: .customDump) {
@@ -87,6 +89,7 @@
         #expect(remindersLists.count == 0)
 
         await testClock.advance(by: .seconds(1))
+        _ = try await syncEngine.waitForSettlement()
         try await $remindersLists.load()
         #expect(remindersLists.count == 0)
         assertInlineSnapshot(of: container, as: .customDump) {
